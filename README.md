@@ -71,9 +71,6 @@ the (slow, rate-limited) API calls.
 ```
 scripts/
   run_pipeline.py          The only working entry point (collect -> train -> report)
-  download_data.py         EMPTY stub
-  train_models.py          EMPTY stub
-  make_predictions.py      EMPTY stub
 
 config/
   settings.py              Active configuration (currently holds FAST-MODE values)
@@ -127,7 +124,6 @@ src/
     constants.py             Default hyperparameters (reference values)
     helpers.py               Date/name/formatting utilities
 
-tests/                     ALL EMPTY - there is no test coverage yet
 ```
 
 ---
