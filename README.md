@@ -501,11 +501,6 @@ tickers.
 `best_model_checkpoint.pth`, so concurrent or successive runs overwrite each
 other's checkpoints.
 
-**Leftover artifacts.** `cpp/` holds stale build output from a previous C++
-port (~580 MB of `build/` and `vcpkg_installed/`) and the C++ sources are gone.
-Root-level `AAPL_model.pt`, `GOOGL_*.xlsx`, and `MSFT_*.xlsx` are also from that
-port. All are safe to delete; they are git-ignored.
-
 ---
 
 ## Troubleshooting
