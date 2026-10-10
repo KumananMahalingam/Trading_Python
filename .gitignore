@@ -1,4 +1,3 @@
-"""
 # Python
 __pycache__/
 *.py[cod]
@@ -20,9 +19,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # Virtual Environment
 venv/
+.venv/
+.venv-win/
 ENV/
 env/
 
@@ -48,6 +50,11 @@ data/processed/*
 data/models/*
 !data/models/.gitkeep
 
+# Prediction service runtime state
+models/
+*.db
+*.joblib
+
 # Outputs
 outputs/plots/*
 outputs/reports/*
@@ -56,6 +63,8 @@ outputs/reports/*
 
 # Secrets
 config/secret_key.py
+.env
+ml_service/.env
 
 # SEC filings
 sec-edgar-filings/
@@ -66,4 +75,6 @@ sec-edgar-filings/
 # OS
 .DS_Store
 Thumbs.db
-"""
+
+# Separate repository moved into this folder
+Trading_Platform/
