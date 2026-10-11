@@ -50,8 +50,8 @@ data/processed/*
 data/models/*
 !data/models/.gitkeep
 
-# Prediction service runtime state
-models/
+# Prediction service runtime state (root-anchored so src/models/ stays tracked)
+/models/
 *.db
 *.joblib
 

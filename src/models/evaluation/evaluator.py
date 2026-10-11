@@ -45,10 +45,6 @@ def evaluate_enhanced_model(model, test_loader, scalers, device, n_samples=10):
             alphas = alphas.to(device)
             prices_temporal = prices_temporal.to(device)
 
-            # Skip single-sample batches
-            if alphas.shape[0] == 1:
-                continue
-
             # Get predictions with uncertainty
             predictions, uncertainties = model(alphas, prices_temporal, n_samples=n_samples, training=False)
 
@@ -73,18 +69,25 @@ def evaluate_enhanced_model(model, test_loader, scalers, device, n_samples=10):
     actuals = np.concatenate(all_targets).flatten()
     uncertainties = np.concatenate(all_uncertainties).flatten()
 
-    # Inverse transform if scaler is available
-    if 'target' in scalers:
-        predictions_unscaled = scalers['target'].inverse_transform(predictions.reshape(-1, 1)).flatten()
-        actuals_unscaled = scalers['target'].inverse_transform(actuals.reshape(-1, 1)).flatten()
-    else:
-        predictions_unscaled = predictions
-        actuals_unscaled = actuals
+    predictions_unscaled, actuals_unscaled, uncertainties = _to_return_units(
+        predictions, actuals, uncertainties, scalers
+    )
 
     # Calculate comprehensive metrics
     metrics = calculate_comprehensive_metrics(predictions_unscaled, actuals_unscaled, uncertainties)
 
     return predictions_unscaled, actuals_unscaled, uncertainties, metrics
+
+
+def _to_return_units(predictions, actuals, uncertainties, scalers):
+    """Undo target scaling. MC-dropout std scales by the scaler's std only."""
+    scaler = scalers.get('target') if scalers else None
+    if scaler is None:
+        return predictions, actuals, uncertainties
+    preds = scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
+    acts = scaler.inverse_transform(actuals.reshape(-1, 1)).flatten()
+    scale = float(scaler.scale_[0]) if getattr(scaler, 'scale_', None) is not None else 1.0
+    return preds, acts, uncertainties * scale
 
 
 def evaluate_enhanced_model_with_viz(model, test_loader, test_df, scalers,
@@ -127,9 +130,6 @@ def evaluate_enhanced_model_with_viz(model, test_loader, test_df, scalers,
             alphas = alphas.to(device)
             prices_temporal = prices_temporal.to(device)
 
-            if alphas.shape[0] == 1:
-                continue
-
             predictions, uncertainties = model(alphas, prices_temporal,
                                               n_samples=n_samples, training=False)
 
@@ -153,13 +153,9 @@ def evaluate_enhanced_model_with_viz(model, test_loader, test_df, scalers,
     actuals = np.concatenate(all_targets).flatten()
     uncertainties = np.concatenate(all_uncertainties).flatten()
 
-    # Inverse transform
-    if 'target' in scalers:
-        predictions_unscaled = scalers['target'].inverse_transform(predictions.reshape(-1, 1)).flatten()
-        actuals_unscaled = scalers['target'].inverse_transform(actuals.reshape(-1, 1)).flatten()
-    else:
-        predictions_unscaled = predictions
-        actuals_unscaled = actuals
+    predictions_unscaled, actuals_unscaled, uncertainties = _to_return_units(
+        predictions, actuals, uncertainties, scalers
+    )
 
     # Get dates and initial price from test_df
     dates = None

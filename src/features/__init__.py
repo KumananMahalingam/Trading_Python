@@ -5,6 +5,7 @@ from .feature_engineering import (
     add_alternative_features_to_df,
     add_advanced_features,
     prepare_dataframe_for_alpha,
+    create_target,
     create_target_safely
 )
 from .feature_selector import select_top_features
@@ -16,6 +17,7 @@ __all__ = [
     'add_alternative_features_to_df',
     'add_advanced_features',
     'prepare_dataframe_for_alpha',
+    'create_target',
     'create_target_safely',
     'select_top_features'
 ]

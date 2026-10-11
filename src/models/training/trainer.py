@@ -1,213 +1,66 @@
 """
-Model training functions
-NOTE: This is Part 1 of 2 - contains prepare_data and training epoch functions
-Part 2 will contain train_stock_predictor and train_ensemble
+Model training functions.
+
+Data preparation lives in ``data_prep.py`` (contiguous date-ordered splits,
+train-only scalers). This module trains single models and ensembles on a
+``PreparedData`` bundle.
 """
+import copy
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+import torch
+import torch.optim as optim
 
-from src.models.training.dataset import EnhancedStockDataset
+from src.models.training.data_prep import (
+    InsufficientDataError,
+    PreparedData,
+    prepare_training_data,
+)
 from src.models.training.losses import create_balanced_hybrid_loss
-from src.features.alpha_computer import EnhancedAlphaComputer
-from src.features.feature_engineering import add_advanced_features, create_target_safely
-from src.features.feature_selector import select_top_features
 from src.models.architectures.dual_stream_lstm import ImprovedDualStreamLSTM
 from src.models.architectures.ensemble import ModelEnsemble
-from src.models.evaluation.evaluator import evaluate_enhanced_model, evaluate_enhanced_model_with_viz
-from src.visualization.training_plots import plot_training_progress
-from src.visualization.prediction_plots import plot_enhanced_predictions
-from src.visualization.stock_price_plots import plot_stock_price_predictions
+from src.models.evaluation.evaluator import evaluate_enhanced_model
 
 
 def prepare_data_with_fixes(df, ticker, alpha_text, window_size=30,
                             use_feature_selection=True, top_k=30):
     """
-    Enhanced data preparation with all fixes applied
+    Legacy wrapper around :func:`prepare_training_data`.
+
+    Returns ``(train_loader, val_loader, test_loader, scalers, num_alphas,
+    test_dates, train_df)``, or Nones with ``num_alphas=0`` when there is not
+    enough data.
+
+    ``use_feature_selection`` / ``top_k`` are accepted for compatibility but no
+    longer used: the model only consumes alpha_*, close and temporal columns,
+    so selection never changed its inputs.
     """
     print(f"\n{'='*80}")
-    print(f"PREPARING DATA FOR {ticker} (WITH FIXES)")
+    print(f"PREPARING DATA FOR {ticker} (contiguous time-series split)")
     print(f"{'='*80}")
 
-    # Add temporal features
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'])
-        df['day_of_week'] = df['date'].dt.dayofweek / 6.0
-        df['day_of_month'] = df['date'].dt.day / 31.0
-        df['month'] = df['date'].dt.month / 12.0
-
-    # Add advanced features
-    df = add_advanced_features(df)
-
-    # Create target SAFELY (no data leakage)
-    df = create_target_safely(df)
-
-    # Compute alphas
-    alpha_computer = EnhancedAlphaComputer(df)
-    df, num_alphas = alpha_computer.add_alphas_from_text(alpha_text, max_alphas=5)
-
-    selected_features = None
-    feature_scores = None
-
-    if use_feature_selection:
-        print(f"\n{'='*80}")
-        print("APPLYING FEATURE SELECTION")
-        print(f"{'='*80}")
-
-        # Select top features
-        selected_features, feature_scores = select_top_features(
-            df=df,
-            target_col='target',
-            top_k=top_k,
-            method='both',
-            exclude_cols=['date', 'ticker'],
-            min_correlation=0.01
-        )
-
-        # Always include alpha features
-        alpha_features = [col for col in df.columns if col.startswith('alpha_')]
-        for alpha_feat in alpha_features:
-            if alpha_feat not in selected_features:
-                selected_features.append(alpha_feat)
-
-        # Always include temporal features
-        temporal_features = ['day_of_week', 'day_of_month', 'month']
-        temporal_features = [f for f in temporal_features if f in df.columns]
-        for temp_feat in temporal_features:
-            if temp_feat not in selected_features:
-                selected_features.append(temp_feat)
-
-        # Always include price features for dual stream
-        price_features = ['open', 'high', 'low', 'close', 'volume']
-        price_features = [f for f in price_features if f in df.columns]
-        for price_feat in price_features:
-            if price_feat not in selected_features:
-                selected_features.append(price_feat)
-
-        print(f"\n✓ Final feature set: {len(selected_features)} features")
-        print(f"  - Alpha features: {len([f for f in selected_features if 'alpha_' in f])}")
-        print(f"  - Temporal features: {len([f for f in selected_features if f in temporal_features])}")
-        print(f"  - Price features: {len([f for f in selected_features if f in price_features])}")
-
-        # Keep only selected features + target + date
-        keep_cols = selected_features + ['target']
-        if 'date' in df.columns:
-            keep_cols.append('date')
-
-        keep_cols = list(dict.fromkeys(keep_cols))
-        df = df[keep_cols].copy()
-
-    # Check class balance BEFORE splitting
-    if 'target' in df.columns:
-        up_pct = (df['target'] > 0).sum() / len(df) * 100
-        down_pct = (df['target'] < 0).sum() / len(df) * 100
-        neutral_pct = (df['target'] == 0).sum() / len(df) * 100
-
-        print(f"\n📊 Target Distribution (BEFORE split):")
-        print(f"  UP: {up_pct:.1f}%")
-        print(f"  DOWN: {down_pct:.1f}%")
-        print(f"  NEUTRAL: {neutral_pct:.1f}%")
-
-        if up_pct > 70 or down_pct > 70:
-            print(f"⚠️ WARNING: Severe class imbalance detected!")
-
-    # Handle missing values
-    for col in df.columns:
-        if col not in ['date', 'target']:
-            if df[col].dtype in ['float64', 'int64']:
-                df[col] = df[col].ffill().bfill().fillna(0)
-
-    # Drop rows with NaN target
-    df = df.dropna(subset=['target'])
-
-    if len(df) < window_size + 50:
-        print(f"❌ ERROR: Insufficient data")
+    try:
+        prepared = prepare_training_data(df, alpha_text, window_size=window_size)
+    except InsufficientDataError as e:
+        print(f"❌ ERROR: Insufficient data: {e}")
         return None, None, None, None, 0, None, None
 
-    # Create binary labels for stratification
-    df['target_class'] = (df['target'] > 0).astype(int)
+    _print_split_summary(prepared)
+    train_loader, val_loader, test_loader = prepared.make_loaders()
+    test_dates = prepared.dates_for(prepared.splits.test)
+    return (train_loader, val_loader, test_loader, prepared.scalers,
+            prepared.num_alphas, test_dates, prepared.train_df)
 
-    # Stratified split
-    train_val_indices, test_indices = train_test_split(
-        np.arange(len(df)),
-        test_size=0.2,
-        stratify=df['target_class'],
-        random_state=42
-    )
 
-    train_indices, val_indices = train_test_split(
-        train_val_indices,
-        test_size=0.20,
-        stratify=df.iloc[train_val_indices]['target_class'],
-        random_state=42
-    )
-
-    # Sort indices to maintain temporal order
-    train_indices = np.sort(train_indices)
-    val_indices = np.sort(val_indices)
-    test_indices = np.sort(test_indices)
-
-    train_df = df.iloc[train_indices].copy()
-    val_df = df.iloc[val_indices].copy()
-    test_df = df.iloc[test_indices].copy()
-
-    # Remove temporary column
-    for split_df in [train_df, val_df, test_df]:
-        if 'target_class' in split_df.columns:
-            split_df.drop('target_class', axis=1, inplace=True)
-
-    print(f"\n✓ Stratified split:")
-    print(f"  Train: {len(train_df)} samples")
-    print(f"  Val: {len(val_df)} samples")
-    print(f"  Test: {len(test_df)} samples")
-
-    # Check class distribution in each split
-    for name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
-        up_pct = (split_df['target'] > 0).sum() / len(split_df) * 100
-        down_pct = (split_df['target'] < 0).sum() / len(split_df) * 100
-        print(f"  {name} - UP: {up_pct:.1f}%, DOWN: {down_pct:.1f}%")
-
-    # Scale features
-    alpha_cols = [col for col in df.columns if col.startswith('alpha_')]
-    price_cols = ['open', 'high', 'low', 'close', 'volume']
-
-    scalers = {}
-
-    for group_name, group_cols in [('alphas', alpha_cols), ('price', price_cols), ('target', ['target'])]:
-        existing_cols = [col for col in group_cols if col in train_df.columns]
-        if not existing_cols:
-            continue
-
-        scaler = StandardScaler()
-        train_df[existing_cols] = scaler.fit_transform(train_df[existing_cols])
-        val_df[existing_cols] = scaler.transform(val_df[existing_cols])
-        test_df[existing_cols] = scaler.transform(test_df[existing_cols])
-
-        scalers[group_name] = scaler
-
-    # Create datasets
-    train_dataset = EnhancedStockDataset(train_df, window_size=window_size, augment=True)
-    val_dataset = EnhancedStockDataset(val_df, window_size=window_size, augment=False)
-    test_dataset = EnhancedStockDataset(test_df, window_size=window_size, augment=False)
-
-    # Adaptive batch size
-    batch_size = min(64, max(16, len(train_dataset) // 10))
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    test_dates = test_df['date'].values if 'date' in test_df.columns else None
-
-    print(f"\n✓ Data preparation complete with fixes applied!")
-
-    return train_loader, val_loader, test_loader, scalers, num_alphas, test_dates, train_df
+def _print_split_summary(prepared):
+    for name, info in prepared.split_summary().items():
+        if name == 'forward':
+            print(f"  Forward window as of {info['as_of']}")
+        else:
+            rows = getattr(prepared.splits, name)
+            up = float((prepared.raw['target'].to_numpy()[rows] > 0).mean() * 100)
+            print(f"  {name.capitalize():5s}: {info['start']} -> {info['end']} "
+                  f"({info['samples']} samples, UP {up:.1f}%)")
 
 
 def train_epoch_enhanced(model, train_loader, criterion, optimizer, device, scheduler=None):
@@ -267,10 +120,6 @@ def validate_enhanced(model, val_loader, criterion, device, n_samples=5):
             prices_temporal = prices_temporal.to(device)
             targets = targets.to(device)
 
-            # Skip batches with size 1
-            if alphas.shape[0] == 1:
-                continue
-
             predictions, uncertainties = model(alphas, prices_temporal, n_samples=n_samples, training=False)
 
             loss = criterion(predictions, targets)
@@ -319,19 +168,38 @@ def validate_enhanced(model, val_loader, criterion, device, n_samples=5):
 
     return metrics, all_predictions, all_targets, all_uncertainties
 
+
+def _direction_counts(predictions, targets):
+    pred_sign = torch.sign(predictions).detach()
+    true_sign = torch.sign(targets).detach()
+    up_mask = true_sign > 0
+    down_mask = true_sign < 0
+    return (
+        (pred_sign == true_sign).float().sum().item(),
+        (pred_sign[up_mask] > 0).float().sum().item(), up_mask.sum().item(),
+        (pred_sign[down_mask] < 0).float().sum().item(), down_mask.sum().item(),
+    )
+
+
 def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
-                     learning_rate=3e-4, device='cpu', train_df=None):
+                     learning_rate=3e-4, device='cpu', train_df=None, patience=30):
     """
-    Training with proper class balancing and regularization
+    Training with proper class balancing and regularization.
+
+    The best weights are kept in memory (no shared checkpoint files), chosen by:
+      1. validation loss improves and min(up, down) precision >= 20%, or
+      2. min(up, down) precision reaches a new best >= 25%.
+    If neither ever happens, the lowest-validation-loss weights are used.
     """
     print(f"\n{'='*80}")
     print("TRAINING WITH FIXES")
     print(f"{'='*80}")
 
-    # Create balanced loss
+    if len(train_loader) == 0 or len(val_loader) == 0:
+        raise ValueError("train_with_fixes needs non-empty train and validation loaders")
+
     criterion = create_balanced_hybrid_loss(train_df)
 
-    # Optimizer with stronger weight decay
     optimizer = optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -339,7 +207,6 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
         betas=(0.9, 0.999)
     )
 
-    # Cosine annealing scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=10,
@@ -348,38 +215,25 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
     )
 
     best_val_loss = float('inf')
-    best_val_acc = 0
-    patience_counter = 0
-    patience = 30
-
-    # Track best balanced metric separately
     best_balanced_metric = 0
+    patience_counter = 0
 
-    train_losses = []
-    val_losses = []
-    train_accuracies = []
-    val_accuracies = []
-    learning_rates = []
+    best = None                # selected checkpoint (criteria above)
+    lowest_loss = None         # fallback: lowest validation loss regardless of balance
+    lowest_loss_value = float('inf')
 
-    # Track UP/DOWN precision separately
-    train_up_precisions = []
-    train_down_precisions = []
-    val_up_precisions = []
-    val_down_precisions = []
+    history = {k: [] for k in (
+        'train_losses', 'val_losses', 'train_accuracies', 'val_accuracies', 'learning_rates',
+        'train_up_precisions', 'train_down_precisions', 'val_up_precisions', 'val_down_precisions',
+    )}
 
     for epoch in range(num_epochs):
         # Train
         model.train()
         total_loss = 0
-        total_correct = 0
-        total_samples = 0
-        up_correct = 0
-        up_total = 0
-        down_correct = 0
-        down_total = 0
+        correct = up_c = up_t = down_c = down_t = n = 0
 
-        for batch in train_loader:
-            alphas, prices_temporal, targets = batch
+        for alphas, prices_temporal, targets in train_loader:
             alphas = alphas.to(device)
             prices_temporal = prices_temporal.to(device)
             targets = targets.to(device)
@@ -387,98 +241,53 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
             optimizer.zero_grad()
             predictions = model(alphas, prices_temporal, training=True)
             loss = criterion(predictions, targets)
-
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # Calculate metrics
-            pred_sign = torch.sign(predictions).detach()
-            true_sign = torch.sign(targets).detach()
-
-            correct = (pred_sign == true_sign).float()
-            total_correct += correct.sum().item()
-            total_samples += len(targets)
-
-            # Track UP/DOWN separately
-            up_mask = true_sign > 0
-            down_mask = true_sign < 0
-
-            if up_mask.any():
-                up_correct += (pred_sign[up_mask] > 0).float().sum().item()
-                up_total += up_mask.sum().item()
-
-            if down_mask.any():
-                down_correct += (pred_sign[down_mask] < 0).float().sum().item()
-                down_total += down_mask.sum().item()
-
+            c, uc, ut, dc, dt = _direction_counts(predictions, targets)
+            correct += c; up_c += uc; up_t += ut; down_c += dc; down_t += dt
+            n += len(targets)
             total_loss += loss.item()
 
         train_loss = total_loss / len(train_loader)
-        train_acc = (total_correct / total_samples) * 100
-        train_up_prec = (up_correct / up_total * 100) if up_total > 0 else 0
-        train_down_prec = (down_correct / down_total * 100) if down_total > 0 else 0
-
-        train_losses.append(train_loss)
-        train_accuracies.append(train_acc)
-        train_up_precisions.append(train_up_prec)
-        train_down_precisions.append(train_down_prec)
+        train_acc = correct / n * 100
+        train_up_prec = up_c / up_t * 100 if up_t else 0
+        train_down_prec = down_c / down_t * 100 if down_t else 0
 
         # Validate
         model.eval()
         val_loss = 0
-        val_correct = 0
-        val_samples = 0
-        val_up_correct = 0
-        val_up_total = 0
-        val_down_correct = 0
-        val_down_total = 0
-
+        correct = up_c = up_t = down_c = down_t = n = 0
         with torch.no_grad():
-            for batch in val_loader:
-                alphas, prices_temporal, targets = batch
+            for alphas, prices_temporal, targets in val_loader:
                 alphas = alphas.to(device)
                 prices_temporal = prices_temporal.to(device)
                 targets = targets.to(device)
 
                 predictions = model(alphas, prices_temporal, training=True)
-                loss = criterion(predictions, targets)
+                val_loss += criterion(predictions, targets).item()
 
-                pred_sign = torch.sign(predictions)
-                true_sign = torch.sign(targets)
-
-                correct = (pred_sign == true_sign).float()
-                val_correct += correct.sum().item()
-                val_samples += len(targets)
-
-                up_mask = true_sign > 0
-                down_mask = true_sign < 0
-
-                if up_mask.any():
-                    val_up_correct += (pred_sign[up_mask] > 0).float().sum().item()
-                    val_up_total += up_mask.sum().item()
-
-                if down_mask.any():
-                    val_down_correct += (pred_sign[down_mask] < 0).float().sum().item()
-                    val_down_total += down_mask.sum().item()
-
-                val_loss += loss.item()
+                c, uc, ut, dc, dt = _direction_counts(predictions, targets)
+                correct += c; up_c += uc; up_t += ut; down_c += dc; down_t += dt
+                n += len(targets)
 
         val_loss /= len(val_loader)
-        val_acc = (val_correct / val_samples) * 100
-        val_up_prec = (val_up_correct / val_up_total * 100) if val_up_total > 0 else 0
-        val_down_prec = (val_down_correct / val_down_total * 100) if val_down_total > 0 else 0
+        val_acc = correct / n * 100
+        val_up_prec = up_c / up_t * 100 if up_t else 0
+        val_down_prec = down_c / down_t * 100 if down_t else 0
 
-        val_losses.append(val_loss)
-        val_accuracies.append(val_acc)
-        val_up_precisions.append(val_up_prec)
-        val_down_precisions.append(val_down_prec)
-
-        # Step scheduler
         scheduler.step()
-        learning_rates.append(optimizer.param_groups[0]['lr'])
 
-        # Print progress with UP/DOWN precision
+        for key, value in (
+            ('train_losses', train_loss), ('val_losses', val_loss),
+            ('train_accuracies', train_acc), ('val_accuracies', val_acc),
+            ('learning_rates', optimizer.param_groups[0]['lr']),
+            ('train_up_precisions', train_up_prec), ('train_down_precisions', train_down_prec),
+            ('val_up_precisions', val_up_prec), ('val_down_precisions', val_down_prec),
+        ):
+            history[key].append(value)
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"Epoch [{epoch+1:3d}/{num_epochs}]")
             print(f"  Train - Loss: {train_loss:.6f}, Acc: {train_acc:.1f}%, "
@@ -486,287 +295,226 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
             print(f"  Val   - Loss: {val_loss:.6f}, Acc: {val_acc:.1f}%, "
                   f"UP: {val_up_prec:.1f}%, DOWN: {val_down_prec:.1f}%")
 
-        # Calculate balanced metric
         balanced_metric = min(val_up_prec, val_down_prec)
+        snapshot = lambda: {
+            'epoch': epoch,
+            'model_state_dict': copy.deepcopy(model.state_dict()),
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'val_up_prec': val_up_prec,
+            'val_down_prec': val_down_prec,
+            'balanced_metric': balanced_metric,
+        }
 
-        # Save model if:
-        # 1. Loss is improving AND balanced metric > 20%
-        # OR
-        # 2. Balanced metric is best so far (even if loss is worse)
-
-        save_model = False
+        if val_loss < lowest_loss_value:
+            lowest_loss_value = val_loss
+            lowest_loss = snapshot()
 
         if val_loss < best_val_loss and balanced_metric >= 20:
-            # Both loss and balance are good
             best_val_loss = val_loss
-            best_val_acc = val_acc
             patience_counter = 0
-            save_model = True
-            print(f"  ✓ Saving: Better loss ({val_loss:.6f}) + balanced ({balanced_metric:.1f}%)")
-
+            best = snapshot()
+            print(f"  ✓ Keeping: better loss ({val_loss:.6f}) + balanced ({balanced_metric:.1f}%)")
         elif balanced_metric > best_balanced_metric and balanced_metric >= 25:
-            # Best balance so far
             best_balanced_metric = balanced_metric
-            best_val_acc = val_acc
             patience_counter = 0
-            save_model = True
-            print(f"  ✓ Saving: Best balance ({balanced_metric:.1f}%)")
-
+            best = snapshot()
+            print(f"  ✓ Keeping: best balance ({balanced_metric:.1f}%)")
         else:
             patience_counter += 1
 
-        if save_model:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'val_up_prec': val_up_prec,
-                'val_down_prec': val_down_prec,
-                'balanced_metric': balanced_metric,
-            }, 'best_model_checkpoint.pth')
-
-            torch.save(model.state_dict(), 'best_model.pth')
-
-        # Stop if no improvement for patience epochs
         if patience_counter >= patience:
             print(f"\n⚠️  Early stopping at epoch {epoch+1}")
-            print(f"  Best validation accuracy: {best_val_acc:.1f}%")
             break
 
-    # Load best model
-    checkpoint = torch.load('best_model_checkpoint.pth')
+    checkpoint = best if best is not None else lowest_loss
+    if best is None:
+        print("  ⚠️ No epoch met the balance criteria; using lowest validation loss weights")
     model.load_state_dict(checkpoint['model_state_dict'])
 
     print(f"\n✓ Training complete!")
     print(f"  Best val accuracy: {checkpoint['val_acc']:.1f}%")
     print(f"  Best UP precision: {checkpoint['val_up_prec']:.1f}%")
     print(f"  Best DOWN precision: {checkpoint['val_down_prec']:.1f}%")
-    print(f"  Balanced metric: {checkpoint.get('balanced_metric', 0):.1f}%")
+    print(f"  Balanced metric: {checkpoint['balanced_metric']:.1f}%")
 
-    return model, {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accuracies': train_accuracies,
-        'val_accuracies': val_accuracies,
-        'learning_rates': learning_rates,
-        'train_up_precisions': train_up_precisions,
-        'train_down_precisions': train_down_precisions,
-        'val_up_precisions': val_up_precisions,
-        'val_down_precisions': val_down_precisions,
-        'best_epoch': checkpoint['epoch']
-    }
+    history['best_epoch'] = checkpoint['epoch']
+    return model, history
 
-def train_stock_predictor(ticker, company_name, comprehensive_df, alpha_text, num_epochs=150, device='cpu'):
+
+# ---------------------------------------------------------------------------
+# Model / ensemble construction
+# ---------------------------------------------------------------------------
+
+def default_member_configs(n_models):
+    """Hyperparameters per ensemble member (varied dropout and learning rate)."""
+    return [
+        {
+            'hidden_size': 128,
+            'num_layers': 3,
+            'dropout': round(0.3 + i * 0.05, 4),
+            'num_heads': 4,
+            'learning_rate': 3e-4 * (0.8 ** i),
+        }
+        for i in range(n_models)
+    ]
+
+
+def build_model(num_alphas, config, device='cpu'):
+    return ImprovedDualStreamLSTM(
+        num_alphas=num_alphas,
+        hidden_size=config['hidden_size'],
+        num_layers=config['num_layers'],
+        dropout=config['dropout'],
+        num_heads=config['num_heads'],
+    ).to(device)
+
+
+def train_ensemble_on_prepared(prepared: PreparedData, n_models=3, num_epochs=100,
+                               device='cpu', member_configs=None, batch_size=None):
+    """Train ``n_models`` members on one prepared split.
+
+    Returns ``(ensemble, member_configs, histories)``.
     """
-    Main function to train enhanced stock predictor
+    configs = member_configs or default_member_configs(n_models)
+    train_loader, val_loader, _ = prepared.make_loaders(batch_size=batch_size)
+
+    models, histories = [], []
+    for i, cfg in enumerate(configs):
+        print(f"\nTraining model {i+1}/{len(configs)}...")
+        model = build_model(prepared.num_alphas, cfg, device)
+        model, history = train_with_fixes(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=num_epochs,
+            learning_rate=cfg['learning_rate'],
+            device=device,
+            train_df=prepared.train_df,
+        )
+        models.append(model)
+        histories.append(history)
+
+    ensemble = ModelEnsemble(models).to(device)
+    return ensemble, configs, histories
+
+
+def evaluate_on_test(model, prepared: PreparedData, device='cpu', n_samples=10):
+    """(predictions, actuals, uncertainties, metrics) on the test block, in return units."""
+    _, _, test_loader = prepared.make_loaders()
+    return evaluate_enhanced_model(model, test_loader, prepared.scalers, device, n_samples=n_samples)
+
+
+def _price_plot_inputs(prepared: PreparedData):
+    """Dates of each predicted close and the close the first prediction starts from."""
+    rows = prepared.splits.test
+    dates = prepared.raw['date'].to_numpy()[rows + 1]   # target[r] realizes on row r+1
+    initial_price = float(prepared.raw['close'].iloc[int(rows[0])])
+    return dates, initial_price
+
+
+def _print_test_metrics(metrics):
+    print(f"\nTest Set Performance:")
+    for key, fmt in (('RMSE', '.6f'), ('MAE', '.6f'), ('Directional Accuracy', '.2f'),
+                     ('Up Precision', '.2f'), ('Down Precision', '.2f'),
+                     ('Large Move Hit Rate', '.2f'), ('Sharpe Ratio', '.3f'),
+                     ('Win Rate', '.2f'), ('Avg Uncertainty', '.6f'),
+                     ('Uncertainty Correlation', '.3f')):
+        if key in metrics:
+            print(f"  {key}: {metrics[key]:{fmt}}")
+
+
+# ---------------------------------------------------------------------------
+# Entry points used by scripts/run_pipeline.py
+# ---------------------------------------------------------------------------
+
+def train_stock_predictor(ticker, company_name, comprehensive_df, alpha_text, num_epochs=150,
+                          device='cpu', window_size=30):
+    """
+    Train a single model. Returns ``(model, metrics, scalers)`` or Nones.
     """
     print(f"\n{'='*80}")
     print(f"ENHANCED TRAINING FOR {company_name} ({ticker})")
     print(f"{'='*80}")
 
-    # Prepare enhanced data
-    train_loader, val_loader, test_loader, scalers, num_alphas, test_dates, train_df = \
-        prepare_data_with_fixes(
-            df=comprehensive_df,
-            ticker=ticker,
-            alpha_text=alpha_text,
-            window_size=30,
-            use_feature_selection=True,  # Enable feature selection
-            top_k=30  # Select top 30 features
-        )
-
-    if train_loader is None:
-        print(f" Data preparation failed for {ticker}")
+    try:
+        prepared = prepare_training_data(comprehensive_df, alpha_text, window_size=window_size)
+    except InsufficientDataError as e:
+        print(f" Data preparation failed for {ticker}: {e}")
         return None, None, None
+    _print_split_summary(prepared)
 
-    # Initialize enhanced model
-    model = ImprovedDualStreamLSTM(
-        num_alphas=num_alphas,
-        hidden_size=128,
-        num_layers=3,
-        dropout=0.3,
-        num_heads=4
-    ).to(device)
+    cfg = default_member_configs(1)[0]
+    model = build_model(prepared.num_alphas, cfg, device)
+    print(f"\nModel: {prepared.num_alphas} alphas, hidden {model.hidden_size}, "
+          f"{sum(p.numel() for p in model.parameters()):,} parameters, device {device}")
 
-    print(f"\nModel Architecture:")
-    print(f"  - Alpha stream: {num_alphas} features")
-    print(f"  - Hidden size: {model.hidden_size}")
-    print(f"  - Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  - Device: {device}")
-
+    train_loader, val_loader, _ = prepared.make_loaders()
     model, training_history = train_with_fixes(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         num_epochs=num_epochs,
-        learning_rate=3e-4,
+        learning_rate=cfg['learning_rate'],
         device=device,
-        train_df=train_df
+        train_df=prepared.train_df,
     )
 
-    # Evaluate on test set
-    print(f"\n{'='*80}")
-    print("FINAL EVALUATION ON TEST SET")
-    print(f"{'='*80}")
+    predictions, actuals, uncertainties, metrics = evaluate_on_test(model, prepared, device)
+    _print_test_metrics(metrics)
 
-    predictions, actuals, uncertainties, metrics = evaluate_enhanced_model(
-        model=model,
-        test_loader=test_loader,
-        scalers=scalers,
-        device=device,
-        n_samples=10
-    )
+    from src.visualization.training_plots import plot_training_progress
+    from src.visualization.prediction_plots import plot_enhanced_predictions
 
-    # Print metrics
-    print(f"\nTest Set Performance:")
-    print(f"  RMSE: {metrics['RMSE']:.6f}")
-    print(f"  MAE: {metrics['MAE']:.6f}")
-    print(f"  Directional Accuracy: {metrics['Directional Accuracy']:.2f}%")
-    print(f"  Up Precision: {metrics['Up Precision']:.2f}%")
-    print(f"  Down Precision: {metrics['Down Precision']:.2f}%")
-    print(f"  Large Move Hit Rate: {metrics['Large Move Hit Rate']:.2f}%")
-    print(f"  Sharpe Ratio: {metrics['Sharpe Ratio']:.3f}")
-    print(f"  Win Rate: {metrics['Win Rate']:.2f}%")
-    print(f"  Avg Uncertainty: {metrics['Avg Uncertainty']:.6f}")
-    print(f"  Uncertainty Correlation: {metrics['Uncertainty Correlation']:.3f}")
-
-    # Visualize results
-    print(f"\nGenerating visualizations...")
-
-    # Plot training progress
     plot_training_progress(training_history, ticker, save_path=f"{ticker}_training_progress.png")
-
-    # Plot predictions with uncertainty
+    dates, _ = _price_plot_inputs(prepared)
     plot_enhanced_predictions(
-        actuals, predictions, uncertainties, ticker, test_dates,
+        actuals, predictions, uncertainties, ticker, dates,
         save_path=f"{ticker}_predictions_enhanced.png"
     )
 
-    # Feature importance analysis (optional)
-    print(f"\nFeature Analysis:")
+    return model, metrics, prepared.scalers
 
-    # Get alpha feature importance
-    alpha_cols = [col for col in comprehensive_df.columns if col.startswith('alpha_')]
-    if alpha_cols:
-        print(f"  Alpha features: {', '.join(alpha_cols)}")
-
-        # Simple correlation analysis
-        for alpha_col in alpha_cols[:5]:  # Show top 5
-            if alpha_col in comprehensive_df.columns:
-                corr = comprehensive_df[alpha_col].corr(comprehensive_df['target'])
-                print(f"    {alpha_col}: correlation with target = {corr:.3f}")
-
-    return model, metrics, scalers
 
 def train_ensemble(ticker, company_name, comprehensive_df, alpha_text,
-                  n_models=3, window_size=30, device='cpu'):
+                   n_models=3, window_size=30, device='cpu', num_epochs=100):
     """
-    Train an ensemble of models for improved robustness
+    Train an ensemble on one contiguous split. Returns ``(ensemble, metrics, scalers)``.
     """
     print(f"\n{'='*80}")
-    print(f"TRAINING MODEL ENSEMBLE ({n_models} models)")
+    print(f"TRAINING MODEL ENSEMBLE ({n_models} models) FOR {company_name} ({ticker})")
     print(f"{'='*80}")
 
-    models = []
+    try:
+        prepared = prepare_training_data(comprehensive_df, alpha_text, window_size=window_size)
+    except InsufficientDataError as e:
+        print(f" Data preparation failed for {ticker}: {e}")
+        return None, None, None
+    _print_split_summary(prepared)
 
-    # Variables to store for visualization
-    test_df = None
-    val_df = None
-    test_loader = None
-    val_loader = None
-    scalers = None
+    ensemble, _, _ = train_ensemble_on_prepared(
+        prepared, n_models=n_models, num_epochs=num_epochs, device=device
+    )
+    print(f"\n Ensemble created with {len(ensemble.models)} models")
 
-    for i in range(n_models):
-        print(f"\nTraining model {i+1}/{n_models}...")
+    predictions, actuals, uncertainties, metrics = evaluate_on_test(ensemble, prepared, device)
+    if len(predictions) == 0:
+        print(f"\n  No predictions made")
+        return ensemble, None, prepared.scalers
 
-        result = prepare_data_with_fixes(
-            comprehensive_df, ticker, alpha_text,
-            window_size=window_size,
-            use_feature_selection=True,
-            top_k=30
-        )
+    _print_test_metrics(metrics)
 
-        if result[0] is None:
-            continue
+    from src.visualization.stock_price_plots import plot_stock_price_predictions
 
-        train_loader, val_loader, test_loader, scalers, num_alphas, test_dates, train_df = result
+    dates, initial_price = _price_plot_inputs(prepared)
+    plot_stock_price_predictions(
+        actuals=actuals,
+        predictions=predictions,
+        uncertainties=uncertainties,
+        ticker=ticker,
+        test_dates=dates,
+        initial_price=initial_price,
+        save_path=f'{ticker}_stock_price_prediction.png'
+    )
 
-        test_size = len(test_loader.dataset) + window_size if hasattr(test_loader, 'dataset') else 50
-        val_size = len(val_loader.dataset) + window_size if hasattr(val_loader, 'dataset') else 50
-        test_df = comprehensive_df.iloc[-(test_size):].copy()
-        val_df = comprehensive_df.iloc[-(test_size + val_size):-test_size].copy()
-
-        # Initialize model
-        model = ImprovedDualStreamLSTM(
-            num_alphas=num_alphas,
-            hidden_size=128,
-            num_layers=3,
-            dropout=0.3 + i*0.05,  # Vary dropout
-            num_heads=4
-        ).to(device)
-
-        # Train with different learning rate
-        lr = 3e-4 * (0.8 ** i)  # Decaying learning rates
-        model, _ = train_with_fixes(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_epochs=100,  # Fewer epochs per model
-            learning_rate=lr,
-            device=device,
-            train_df=train_df
-        )
-
-        models.append(model)
-
-    # Create ensemble
-    if models:
-        ensemble = ModelEnsemble(models).to(device)
-        print(f"\n Ensemble created with {len(models)} models")
-
-        # Determine which data to use for evaluation
-        if test_loader is None or len(test_loader.dataset) == 0:
-            print("\n Test set is empty, using validation set for evaluation")
-            eval_loader = val_loader
-            eval_df = val_df
-        else:
-            eval_loader = test_loader
-            eval_df = test_df
-
-        # Use new evaluation function with visualization support
-        predictions, actuals, uncertainties, metrics, dates, initial_price = evaluate_enhanced_model_with_viz(
-            model=ensemble,
-            test_loader=eval_loader,
-            test_df=eval_df,
-            scalers=scalers,
-            ticker=ticker,
-            device=device,
-            n_samples=10
-        )
-
-        # Only print and visualize if we have predictions
-        if len(predictions) > 0:
-            print(f"\nEnsemble Performance:")
-            print(f"  Directional Accuracy: {metrics['Directional Accuracy']:.2f}%")
-            print(f"  RMSE: {metrics['RMSE']:.6f}")
-
-            if initial_price is not None and dates is not None:
-                print(f"\n Creating stock price visualization...")
-
-                plot_stock_price_predictions(
-                    actuals=actuals,
-                    predictions=predictions,
-                    uncertainties=uncertainties,
-                    ticker=ticker,
-                    test_dates=dates,
-                    initial_price=initial_price,
-                    save_path=f'{ticker}_stock_price_prediction.png'
-                )
-        else:
-            print(f"\n  No predictions made")
-            metrics = None
-
-        return ensemble, metrics, scalers
-
-    return None, None, None
+    return ensemble, metrics, prepared.scalers

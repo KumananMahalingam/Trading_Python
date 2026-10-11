@@ -54,8 +54,16 @@ def add_alternative_features_to_df(df, ticker, economic_data, sec_sentiment, ear
     return df
 
 
-def add_advanced_features(df):
-    """Add advanced technical indicators and features"""
+def add_advanced_features(df, fill_missing=True):
+    """Add advanced technical indicators and features.
+
+    Args:
+        df: Frame sorted by date.
+        fill_missing: Forward-fill gaps and zero-fill the remaining warm-up NaNs.
+            Values are never back-filled, since that copies future observations
+            into earlier rows. Pass False to keep NaNs (the time-series prep
+            trims warm-up rows itself before filling).
+    """
     df = df.copy()
 
     if df.empty:
@@ -170,11 +178,12 @@ def add_advanced_features(df):
         df.loc[bull_condition, 'market_regime'] = 1
         df.loc[bear_condition, 'market_regime'] = -1
 
-    # Fill NaN values (forward fill for time series, 0 for others)
-    for col in df.columns:
-        if col not in ['date', 'target']:
-            if pd.api.types.is_numeric_dtype(df[col]):
-                df[col] = df[col].ffill().bfill().fillna(0)
+    # Forward fill only (no bfill: that would leak future values into warm-up rows)
+    if fill_missing:
+        for col in df.columns:
+            if col not in ['date', 'target']:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    df[col] = df[col].replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
     print(f"  Added {len(df.columns)} total features")
     return df
@@ -222,17 +231,23 @@ def prepare_dataframe_for_alpha(ticker, stock_df, daily_sentiments, related_comp
     return df
 
 
-def create_target_safely(df):
+def create_target(df):
     """
-    Create target WITHOUT data leakage
+    Add ``target`` = next-period return, close[t+1] / close[t] - 1.
+
+    Row t's features only use data up to t, and its label is strictly in the
+    future. The last row keeps a NaN target: it is the window that predicts
+    the next, not-yet-observed period, so inference needs it.
     """
     df = df.copy()
-
     if 'close' in df.columns:
-        # Next day's return
         df['target'] = df['close'].pct_change(1).shift(-1)
+    return df
 
-        # Drop the last row (has NaN target)
+
+def create_target_safely(df):
+    """Legacy variant of :func:`create_target` that drops the unlabeled last row."""
+    df = create_target(df)
+    if 'target' in df.columns:
         df = df[:-1].copy()
-
     return df

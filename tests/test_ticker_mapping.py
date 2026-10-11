@@ -35,13 +35,21 @@ def test_all_seeded_crypto_pairs_map():
         assert info.asset_type == CRYPTO
         assert info.is_crypto
         assert info.base == base
-        assert info.news == f"X:{base}USD"
         assert info.yfinance.endswith("-USD")
+        if base in ("BTC", "ETH"):
+            assert info.has_news
+        else:
+            assert info.news is None and not info.has_news
 
 
-def test_btc_mapping():
-    info = resolve_ticker("btcusdt")
-    assert (info.platform, info.yfinance, info.news) == ("BTCUSDT", "BTC-USD", "X:BTCUSD")
+def test_btc_and_eth_use_etf_news_proxies():
+    btc = resolve_ticker("btcusdt")
+    assert (btc.platform, btc.yfinance, btc.news) == ("BTCUSDT", "BTC-USD", "IBIT")
+    assert resolve_ticker("ETHUSDT").news == "ETHA"
+
+
+def test_stocks_always_have_news():
+    assert resolve_ticker("AAPL").has_news
 
 
 def test_renamed_yahoo_symbols():

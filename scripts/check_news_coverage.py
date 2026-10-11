@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from ml_service.console import ensure_utf8_stdio  # noqa: E402
 from ml_service.settings import load_settings  # noqa: E402
 from ml_service.ticker_mapping import resolve_ticker  # noqa: E402
 from src.data.collectors.news_collector import fetch_news  # noqa: E402
@@ -30,6 +31,9 @@ def _iso(dt: datetime) -> str:
 def report(client, platform_ticker: str, start: datetime, end: datetime, settings) -> None:
     info = resolve_ticker(platform_ticker)
     print(f"\n=== {info.platform} (Polygon news ticker {info.news}, {info.asset_type}) ===")
+    if not info.has_news:
+        print("  No Polygon news source for this asset -> sentiment features will be 0.")
+        return
     t0 = time.monotonic()
     articles = fetch_news(
         client, info.news, _iso(start), _iso(end),
@@ -51,6 +55,7 @@ def report(client, platform_ticker: str, start: datetime, end: datetime, setting
 
 
 def main(argv: list[str]) -> int:
+    ensure_utf8_stdio()
     settings = load_settings()
     if not settings.has_polygon:
         print("POLYGON_API_KEY is not set (env var or ml_service/.env). Aborting.")

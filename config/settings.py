@@ -20,8 +20,10 @@ COMPANY_TICKERS_JSON = "company_tickers.json"
 FORCE_REFETCH = False
 FORCE_REGENERATE_ALPHAS = True
 
-# Date ranges - SHORTER for testing
-START_DATE = "2024-06-01"  # 6 months instead of 2 years
+# Date range: rolling window ending at the run date (scripts/run_pipeline.py).
+LOOKBACK_DAYS = 730
+# Unused legacy values, kept for reference
+START_DATE = "2024-06-01"
 END_DATE = "2025-09-01"
 
 # API settings

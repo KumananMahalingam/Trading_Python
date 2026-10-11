@@ -6,7 +6,7 @@ Replaces the original integrated_pipeline.py with new modular structure
 import time
 import torch
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, Counter
 import re
 import spacy
@@ -200,8 +200,11 @@ def main():
 
     if not load_from_cache:
         # Data collection phase
-        start_date = datetime(2023, 9, 1, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-        end_date = datetime(2025, 9, 1, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        # Rolling window ending now (was hardcoded 2023-09-01 -> 2025-09-01)
+        end_dt = datetime.now(timezone.utc).replace(microsecond=0)
+        start_dt = end_dt - timedelta(days=getattr(settings, 'LOOKBACK_DAYS', 730))
+        start_date = start_dt.isoformat().replace("+00:00", "Z")
+        end_date = end_dt.isoformat().replace("+00:00", "Z")
 
         daily_sentiments = defaultdict(lambda: defaultdict(list))
         validated_mentions = defaultdict(Counter)

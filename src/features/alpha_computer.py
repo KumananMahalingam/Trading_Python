@@ -9,10 +9,18 @@ import pandas as pd
 class EnhancedAlphaComputer:
     """Improved alpha computation with caching and validation"""
 
-    def __init__(self, df):
+    def __init__(self, df, clip_outliers=True):
+        """
+        Args:
+            df: Feature frame.
+            clip_outliers: Clip each alpha to mean +/- 3 std of the whole frame.
+                The time-series prep passes False and clips with bounds fitted
+                on the training rows only, so test rows don't shape the bounds.
+        """
         self.df = df.copy()
         self.available_columns = set(df.columns)
         self.alpha_cache = {}
+        self.clip_outliers = clip_outliers
 
     def parse_alpha_formula(self, formula_str):
         """Extract formula with better parsing"""
@@ -104,11 +112,16 @@ class EnhancedAlphaComputer:
             if result.isna().all() or result.isnull().all():
                 return None
 
+            result = result.astype(float).replace([np.inf, -np.inf], np.nan)
+            if result.isna().all():
+                return None
+
             # Remove extreme outliers (cap at 3 standard deviations)
-            mean = result.mean()
-            std = result.std()
-            if std > 0:
-                result = result.clip(mean - 3*std, mean + 3*std)
+            if self.clip_outliers:
+                mean = result.mean()
+                std = result.std()
+                if std > 0:
+                    result = result.clip(mean - 3*std, mean + 3*std)
 
             # Cache result
             self.alpha_cache[cache_key] = result
@@ -179,24 +192,32 @@ class EnhancedAlphaComputer:
         if alphas_added == 0:
             print(f"  No alphas computed! Using simple technical indicators...")
             self.df = self.add_fallback_alphas()
-            alphas_added = 5
+            alphas_added = len([c for c in self.df.columns if c.startswith('alpha_')])
 
         return self.df, alphas_added
 
     def add_fallback_alphas(self):
-        """Add fallback technical alphas when LLM fails"""
+        """Add fallback technical alphas when LLM fails.
+
+        Columns are numbered contiguously (alpha_1..alpha_k) so the count always
+        matches what the model receives, even when RSI/MACD are unavailable.
+        """
         print("  Adding fallback technical alphas...")
 
-        # Simple momentum alphas
+        candidates = []
         if 'close' in self.df.columns:
-            self.df['alpha_1'] = self.df['close'].pct_change(5)  # 5-day return
-            self.df['alpha_2'] = self.df['close'].pct_change(10)  # 10-day return
-            self.df['alpha_3'] = self.df['close'].rolling(20).mean() / self.df['close'] - 1  # SMA ratio
+            close = self.df['close']
+            candidates.append(close.pct_change(5))                     # 5-day return
+            candidates.append(close.pct_change(10))                    # 10-day return
+            candidates.append(close.rolling(20).mean() / close - 1)    # SMA ratio
 
         if 'RSI' in self.df.columns:
-            self.df['alpha_4'] = (self.df['RSI'] - 50) / 50  # Normalized RSI
+            candidates.append((self.df['RSI'] - 50) / 50)              # Normalized RSI
 
         if 'MACD' in self.df.columns and 'MACD_Signal' in self.df.columns:
-            self.df['alpha_5'] = self.df['MACD'] - self.df['MACD_Signal']  # MACD histogram
+            candidates.append(self.df['MACD'] - self.df['MACD_Signal'])  # MACD histogram
+
+        for i, values in enumerate(candidates, start=1):
+            self.df[f'alpha_{i}'] = values
 
         return self.df
