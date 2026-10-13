@@ -2,7 +2,6 @@
 from .predictor import (
     load_single_model,
     load_ensemble,
-    predict_with_model,
     make_live_prediction
 )
 from .batch_predictor import batch_predict, get_model_info
@@ -10,7 +9,6 @@ from .batch_predictor import batch_predict, get_model_info
 __all__ = [
     'load_single_model',
     'load_ensemble',
-    'predict_with_model',
     'make_live_prediction',
     'batch_predict',
     'get_model_info'

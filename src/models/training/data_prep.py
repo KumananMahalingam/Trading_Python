@@ -29,7 +29,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
-from src.features.alpha_computer import EnhancedAlphaComputer
+from src.features.alpha_computer import FALLBACK_ALPHA_FUNCS, EnhancedAlphaComputer
 from src.features.feature_engineering import add_advanced_features, create_target
 from src.models.training.dataset import (
     ALL_PRICE_COLS,
@@ -43,6 +43,10 @@ CLIP_STDS = 3.0
 
 class InsufficientDataError(ValueError):
     """Not enough rows to build non-empty train/val/test splits."""
+
+
+class AlphaRecomputeError(ValueError):
+    """A saved alpha could not be recomputed on new data (e.g. a column is missing)."""
 
 
 @dataclass(frozen=True)
@@ -89,15 +93,54 @@ def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_alphas(frame: pd.DataFrame, alpha_text: str, max_alphas: int = 5
-                   ) -> Tuple[pd.DataFrame, List[str]]:
-    """Evaluate alpha formulas (falling back to technical alphas) without clipping."""
+                   ) -> Tuple[pd.DataFrame, List[str], List[dict]]:
+    """Evaluate alpha formulas (falling back to technical alphas) without clipping.
+
+    Returns the frame, the alpha column names and one spec per column
+    describing exactly how it was computed (persisted for inference).
+    """
     computer = EnhancedAlphaComputer(frame, clip_outliers=False)
     out, _ = computer.add_alphas_from_text(alpha_text or "", max_alphas=max_alphas)
     alpha_cols = sorted_alpha_cols(out.columns)
     if not alpha_cols:
         raise ValueError("No alpha columns could be computed")
+    specs = list(computer.alpha_specs)
+    if [s['column'] for s in specs] != alpha_cols:
+        raise ValueError(f"Alpha specs {specs} do not match columns {alpha_cols}")
     out[alpha_cols] = out[alpha_cols].astype(float).replace([np.inf, -np.inf], np.nan)
-    return out, alpha_cols
+    return out, alpha_cols, specs
+
+
+def recompute_alphas(frame: pd.DataFrame, specs: List[dict]) -> pd.DataFrame:
+    """Recompute saved alphas on a new frame, column for column.
+
+    Unlike :func:`compute_alphas` this never falls back or renumbers: if any
+    saved alpha can't be evaluated the model inputs would silently shift, so
+    it raises instead.
+    """
+    out = frame.copy()
+    computer = EnhancedAlphaComputer(frame, clip_outliers=False)
+    for spec in specs:
+        column = spec['column']
+        if spec['kind'] == 'formula':
+            is_valid, missing = computer.validate_formula(spec['formula'])
+            if not is_valid:
+                raise AlphaRecomputeError(f"{column}: missing columns {missing}")
+            values = computer.compute_alpha(spec['formula'], column)
+        elif spec['kind'] == 'fallback':
+            if spec['name'] not in FALLBACK_ALPHA_FUNCS:
+                raise AlphaRecomputeError(f"{column}: unknown fallback alpha {spec['name']!r}")
+            required, fn = FALLBACK_ALPHA_FUNCS[spec['name']]
+            missing = [c for c in required if c not in frame.columns]
+            if missing:
+                raise AlphaRecomputeError(f"{column}: missing columns {missing}")
+            values = fn(frame)
+        else:
+            raise AlphaRecomputeError(f"{column}: unknown alpha kind {spec['kind']!r}")
+        if values is None:
+            raise AlphaRecomputeError(f"{column}: formula could not be evaluated")
+        out[column] = pd.Series(values, index=frame.index).astype(float).replace([np.inf, -np.inf], np.nan)
+    return out
 
 
 def trim_warmup(frame: pd.DataFrame, alpha_cols: List[str],
@@ -226,6 +269,7 @@ class PreparedData:
     raw: pd.DataFrame        # filled, unscaled features (real close prices for backtests)
     scaled: pd.DataFrame     # same rows, clipped + scaled model inputs
     alpha_cols: List[str]
+    alpha_specs: List[dict]
     alpha_clip: Dict[str, Tuple[float, float]]
     scalers: Dict[str, StandardScaler]
     splits: SplitRows
@@ -286,7 +330,7 @@ def prepare_training_data(df: pd.DataFrame, alpha_text: str, window_size: int = 
                           max_alphas: int = 5) -> PreparedData:
     """Full time-series-safe preparation from a comprehensive feature frame."""
     frame = build_feature_frame(df)
-    frame, alpha_cols = compute_alphas(frame, alpha_text, max_alphas=max_alphas)
+    frame, alpha_cols, specs = compute_alphas(frame, alpha_text, max_alphas=max_alphas)
     frame = trim_warmup(frame, alpha_cols)
     frame = fill_features(frame)
 
@@ -297,5 +341,47 @@ def prepare_training_data(df: pd.DataFrame, alpha_text: str, window_size: int = 
     scalers = fit_scalers(raw, alpha_cols, splits.fit_end)
     scaled = apply_scalers(raw, scalers, alpha_cols)
 
-    return PreparedData(raw=raw, scaled=scaled, alpha_cols=alpha_cols, alpha_clip=clip,
-                        scalers=scalers, splits=splits, window_size=window_size)
+    return PreparedData(raw=raw, scaled=scaled, alpha_cols=alpha_cols, alpha_specs=specs,
+                        alpha_clip=clip, scalers=scalers, splits=splits, window_size=window_size)
+
+
+# ---------------------------------------------------------------------------
+# Inference (reuses everything fitted at training time)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InferenceData:
+    raw: pd.DataFrame
+    scaled: pd.DataFrame
+    alpha_cols: List[str]
+    window_size: int
+
+    @property
+    def forward_row(self) -> int:
+        return len(self.raw) - 1
+
+    def forward_dataset(self) -> EnhancedStockDataset:
+        return EnhancedStockDataset(self.scaled, window_size=self.window_size, augment=False,
+                                    end_rows=[self.forward_row], alpha_cols=self.alpha_cols)
+
+
+def prepare_inference_data(df: pd.DataFrame, alpha_specs: List[dict],
+                           alpha_clip: Dict[str, Tuple[float, float]],
+                           scalers: Dict[str, StandardScaler], window_size: int) -> InferenceData:
+    """Build model inputs for new data with the saved alphas, clip bounds and scalers.
+
+    The last row of ``df`` is the forecast origin: the model predicts the
+    return from its close to the next period's close.
+    """
+    alpha_cols = [s['column'] for s in alpha_specs]
+    frame = build_feature_frame(df)
+    frame = recompute_alphas(frame, alpha_specs)
+    frame = trim_warmup(frame, alpha_cols)   # same trimming as training, so fills match
+    frame = fill_features(frame)
+    if len(frame) < window_size:
+        raise InsufficientDataError(
+            f"Need at least {window_size} rows after warm-up for a prediction window; got {len(frame)}"
+        )
+    raw = apply_alpha_clip(frame, alpha_clip)
+    scaled = apply_scalers(raw, scalers, alpha_cols)
+    return InferenceData(raw=raw, scaled=scaled, alpha_cols=alpha_cols, window_size=window_size)

@@ -159,6 +159,11 @@ def add_advanced_features(df, fill_missing=True):
         if 'volatility_20d' in df.columns:
             new_features['SentDiv_Vol_Interaction'] = df['Sentiment_Div_AAPL_GOOG'] * df['volatility_20d']
 
+    # Skip features that already exist (prepare_dataframe_for_alpha creates
+    # {ticker}_Sentiment_MA5/_Change with the same definitions); concatenating
+    # them again would produce duplicate column names.
+    new_features = {k: v for k, v in new_features.items() if k not in df.columns}
+
     # Add all new features at once (efficient)
     if new_features:
         new_features_df = pd.DataFrame(new_features, index=df.index)

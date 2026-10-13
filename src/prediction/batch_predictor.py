@@ -73,35 +73,26 @@ def batch_predict(tickers, data_dict, alpha_texts_dict, model_types=None, device
     return results
 
 
-def get_model_info(ticker):
-    """Get information about available models for a ticker"""
-    import glob
-    import os
+def get_model_info(ticker, model_dir=None):
+    """Print what's stored in the model bundle for a ticker"""
+    from ml_service.artifacts import BundleNotFoundError, read_meta
+    from ml_service.settings import load_settings
 
+    model_dir = model_dir if model_dir is not None else load_settings().model_dir
     print(f"\nModel information for {ticker}:")
     print("-" * 50)
+    try:
+        meta = read_meta(model_dir, ticker)
+    except BundleNotFoundError:
+        print("No trained model found")
+        print("-" * 50)
+        return
 
-    # Check for ensemble file
-    ensemble_file = f'{ticker}_ensemble.pth'
-    if os.path.exists(ensemble_file):
-        file_size = os.path.getsize(ensemble_file) / (1024*1024)  # MB
-        print(f"Ensemble file: {ensemble_file} ({file_size:.2f} MB)")
-
-    # Check for individual model files
-    model_files = glob.glob(f"*{ticker}*model*.pth")
-    if model_files:
-        print(f"Individual model files: {len(model_files)} found")
-        for mf in model_files[:3]:
-            file_size = os.path.getsize(mf) / (1024*1024)
-            print(f"  - {os.path.basename(mf)} ({file_size:.2f} MB)")
-        if len(model_files) > 3:
-            print(f"  ... and {len(model_files) - 3} more")
-    else:
-        print("No model files found")
-
-    # Check for training history
-    history_files = glob.glob(f"*{ticker}*training*.png")
-    if history_files:
-        print(f"Training plots: {len(history_files)} found")
-
+    print(f"Trained at:   {meta.get('trained_at')}")
+    print(f"Data range:   {meta.get('data_start')} -> {meta.get('data_end')}")
+    print(f"Members:      {meta.get('num_members')} (alphas: {meta.get('num_alphas')})")
+    metrics = meta.get('metrics') or {}
+    print(f"Test metrics: accuracy {metrics.get('directional_accuracy')}%, "
+          f"up {metrics.get('up_precision')}%, down {metrics.get('down_precision')}% "
+          f"(n={metrics.get('n')})")
     print("-" * 50)

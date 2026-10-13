@@ -14,23 +14,10 @@ from src.models.training.data_prep import (
     split_by_date,
 )
 from src.models.training.dataset import EnhancedStockDataset
+from tests.helpers import TINY_MEMBERS as TINY
+from tests.helpers import synthetic_ohlcv
 
 WINDOW = 10
-
-
-def synthetic_ohlcv(n=320, seed=0, start="2024-01-01"):
-    rng = np.random.default_rng(seed)
-    dates = pd.bdate_range(start, periods=n)
-    close = 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.015, n)))
-    open_ = close * (1 + rng.normal(0, 0.003, n))
-    high = np.maximum(open_, close) * (1 + rng.uniform(0, 0.01, n))
-    low = np.minimum(open_, close) * (1 - rng.uniform(0, 0.01, n))
-    volume = rng.integers(1_000_000, 5_000_000, n).astype(float)
-    df = pd.DataFrame({"date": dates.strftime("%Y-%m-%d"), "open": open_, "high": high,
-                       "low": low, "close": close, "volume": volume})
-    df = calculate_technical_indicators(df)
-    df["TEST_Sentiment"] = rng.normal(0, 0.2, n)
-    return df
 
 
 @pytest.fixture(scope="module")
@@ -174,6 +161,17 @@ def test_alpha_clip_bounds_from_training_rows(prepared):
 def test_simple_alphas_count_matches_columns(prepared):
     assert prepared.num_alphas == 5
     assert prepared.alpha_cols == [f"alpha_{i}" for i in range(1, 6)]
+    assert [s["column"] for s in prepared.alpha_specs] == prepared.alpha_cols
+    assert all(s["kind"] == "formula" for s in prepared.alpha_specs)
+
+
+def test_fallback_specs_are_named():
+    df = synthetic_ohlcv(n=60)
+    computer = EnhancedAlphaComputer(df)
+    computer.add_alphas_from_text("garbage", max_alphas=5)
+    assert [s["name"] for s in computer.alpha_specs] == [
+        "return_5d", "return_10d", "sma20_ratio", "rsi_norm", "macd_hist"]
+    assert all(s["kind"] == "fallback" for s in computer.alpha_specs)
 
 
 def test_fallback_alpha_count_without_rsi_or_macd():
@@ -221,9 +219,6 @@ def test_legacy_wrapper_shape():
     assert len(test_dates) == len(test_loader.dataset)
 
 
-TINY = [{"hidden_size": 16, "num_layers": 1, "dropout": 0.1, "num_heads": 2, "learning_rate": 1e-3},
-        {"hidden_size": 16, "num_layers": 1, "dropout": 0.2, "num_heads": 2, "learning_rate": 1e-3}]
-
 
 def test_tiny_ensemble_trains_without_checkpoint_files(prepared, tmp_path, monkeypatch):
     from src.models.training.trainer import evaluate_on_test, train_ensemble_on_prepared
@@ -242,3 +237,15 @@ def test_tiny_ensemble_trains_without_checkpoint_files(prepared, tmp_path, monke
     expected = prepared.raw["target"].to_numpy()[prepared.splits.test]
     np.testing.assert_allclose(actuals, expected, rtol=1e-4, atol=1e-7)
     assert np.all(unc > 0) and np.all(unc < 1)       # return units, not scaled units
+
+
+def test_feature_frame_has_unique_columns():
+    from collections import defaultdict
+    from src.features.feature_engineering import prepare_dataframe_for_alpha
+
+    prices = synthetic_ohlcv(n=80, sentiment_col=None)[["date", "open", "high", "low", "close", "volume"]]
+    sentiment = defaultdict(lambda: defaultdict(list))
+    sentiment["TEST"][prices["date"].iloc[5]] = [0.5]
+    frame = build_feature_frame(prepare_dataframe_for_alpha("TEST", prices, sentiment, []))
+    assert frame.columns.is_unique
+    assert "TEST_Sentiment_MA5" in frame.columns

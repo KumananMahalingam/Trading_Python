@@ -6,6 +6,18 @@ import numpy as np
 import pandas as pd
 
 
+# Named fallback alphas: (name, required columns, function). Names are stored in
+# model metadata so inference can recompute exactly the same columns.
+FALLBACK_ALPHAS = (
+    ('return_5d', ('close',), lambda df: df['close'].pct_change(5)),
+    ('return_10d', ('close',), lambda df: df['close'].pct_change(10)),
+    ('sma20_ratio', ('close',), lambda df: df['close'].rolling(20).mean() / df['close'] - 1),
+    ('rsi_norm', ('RSI',), lambda df: (df['RSI'] - 50) / 50),
+    ('macd_hist', ('MACD', 'MACD_Signal'), lambda df: df['MACD'] - df['MACD_Signal']),
+)
+FALLBACK_ALPHA_FUNCS = {name: (required, fn) for name, required, fn in FALLBACK_ALPHAS}
+
+
 class EnhancedAlphaComputer:
     """Improved alpha computation with caching and validation"""
 
@@ -21,6 +33,8 @@ class EnhancedAlphaComputer:
         self.available_columns = set(df.columns)
         self.alpha_cache = {}
         self.clip_outliers = clip_outliers
+        # One entry per alpha column created: {'column', 'kind': 'formula'|'fallback', ...}
+        self.alpha_specs = []
 
     def parse_alpha_formula(self, formula_str):
         """Extract formula with better parsing"""
@@ -175,6 +189,7 @@ class EnhancedAlphaComputer:
                         alphas_added += 1
                         col_name = f'alpha_{alphas_added}'
                         self.df[col_name] = alpha_values
+                        self.alpha_specs.append({'column': col_name, 'kind': 'formula', 'formula': formula})
 
                         # Calculate correlation with target for debugging
                         if 'target' in self.df.columns:
@@ -204,20 +219,13 @@ class EnhancedAlphaComputer:
         """
         print("  Adding fallback technical alphas...")
 
-        candidates = []
-        if 'close' in self.df.columns:
-            close = self.df['close']
-            candidates.append(close.pct_change(5))                     # 5-day return
-            candidates.append(close.pct_change(10))                    # 10-day return
-            candidates.append(close.rolling(20).mean() / close - 1)    # SMA ratio
-
-        if 'RSI' in self.df.columns:
-            candidates.append((self.df['RSI'] - 50) / 50)              # Normalized RSI
-
-        if 'MACD' in self.df.columns and 'MACD_Signal' in self.df.columns:
-            candidates.append(self.df['MACD'] - self.df['MACD_Signal'])  # MACD histogram
-
-        for i, values in enumerate(candidates, start=1):
-            self.df[f'alpha_{i}'] = values
+        self.alpha_specs = []
+        i = 0
+        for name, required, fn in FALLBACK_ALPHAS:
+            if all(col in self.df.columns for col in required):
+                i += 1
+                col_name = f'alpha_{i}'
+                self.df[col_name] = fn(self.df)
+                self.alpha_specs.append({'column': col_name, 'kind': 'fallback', 'name': name})
 
         return self.df
