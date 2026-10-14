@@ -1,0 +1,113 @@
+# Local infrastructure for the Go backend.
+#
+#   docker compose up -d                       Postgres + Redis, then Flyway migrations
+#   docker compose --profile ml up -d --build  also runs the ML prediction service
+#   docker compose --profile app up --build    also runs the ML service and the Go backend
+#
+# Credentials match the defaults in internal/config, so no env vars are needed
+# to get a working local stack.
+#
+# The ML service image is built from the repository root, two levels up
+# (Trading_Python/Trading_Platform/trading-backend-go -> Trading_Python).
+# Override ML_REPO_DIR in .env only if you move this folder.
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: trading-postgres
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: trading
+    ports:
+      # Override POSTGRES_HOST_PORT in .env when something already owns 5432,
+      # such as a natively installed PostgreSQL service. Two listeners on the
+      # same port makes which one you reach non-deterministic on Windows.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: trading-redis
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Flyway still owns the schema. The migration files are unchanged from the
+  # Java project, and the flyway_schema_history table stays compatible, so an
+  # existing database keeps working.
+  flyway:
+    image: flyway/flyway:11
+    container_name: trading-flyway
+    command: -connectRetries=20 migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/trading
+      FLYWAY_USER: dev
+      FLYWAY_PASSWORD: dev
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+      FLYWAY_BASELINE_VERSION: "0"
+    volumes:
+      - ./migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Python prediction service (ml_service). API keys and ML_INTERNAL_TOKEN come
+  # from ml_service/.env. Trained models are bind-mounted from the repo's
+  # models/ folder so they are shared with a natively run service; the job
+  # queue database stays in a container volume.
+  ml-service:
+    profiles: ["ml", "app"]
+    build:
+      context: ${ML_REPO_DIR:-../..}
+      dockerfile: ml_service/Dockerfile
+    container_name: trading-ml-service
+    env_file:
+      - ${ML_REPO_DIR:-../..}/ml_service/.env
+    environment:
+      MODEL_DIR: /data/models
+      JOBS_DB_PATH: /data/state/jobs.db
+    ports:
+      # Loopback only: the service trusts anyone holding the internal token.
+      - "127.0.0.1:${ML_HOST_PORT:-8000}:8000"
+    volumes:
+      - ${ML_REPO_DIR:-../..}/models:/data/models
+      - mlstate:/data/state
+
+  backend:
+    profiles: ["app"]
+    build: .
+    container_name: trading-backend-go
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://dev:dev@postgres:5432/trading?sslmode=disable
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY}
+      ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY}
+      ML_SERVICE_URL: http://ml-service:8000
+      # Same value as ML_INTERNAL_TOKEN in ml_service/.env (read from this folder's .env).
+      ML_INTERNAL_TOKEN: ${ML_INTERNAL_TOKEN}
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      # Predictions answer 503 until the ML service is up; the rest of the API does not wait for it.
+      ml-service:
+        condition: service_started
+
+volumes:
+  pgdata:
+  mlstate:

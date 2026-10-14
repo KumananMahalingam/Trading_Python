@@ -76,5 +76,8 @@ sec-edgar-filings/
 .DS_Store
 Thumbs.db
 
-# Separate repository moved into this folder
-Trading_Platform/
+# Trading platform (merged into this repo). Its own .gitignore files cover
+# node_modules, dist and .env; these are listed here too as a safety net.
+/Trading_Platform/trading-frontend/node_modules/
+/Trading_Platform/trading-frontend/dist/
+/Trading_Platform/trading-backend-go/.env

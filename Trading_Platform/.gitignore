@@ -1,0 +1,64 @@
+# Environment variables - NEVER commit these
+.env
+*.env
+.env.local
+.env.production
+
+# Maven build output
+target/
+trading-backend/target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+HELP.md
+
+# Node modules
+trading-frontend/node_modules/
+trading-frontend/dist/
+trading-frontend/.vite/
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.vscode-shared/
+
+# Spring Tool Suite
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+
+# The lightweight-charts is a separate library repo, not our code
+lightweight-charts/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Accidentally committed root-level files (from friend's local setup)
+/bin/
+/src/
+/pom.xml
+/mvnw
+/mvnw.cmd
+/.mvn/

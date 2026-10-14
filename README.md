@@ -70,13 +70,8 @@ A typical run:
 
 ## Repository layout
 
-There are two git repositories. The trading platform lives inside this one
-as `Trading_Platform/` and is excluded by this repo's `.gitignore`:
-
-| Repository | Path | Contents |
-| --- | --- | --- |
-| [Trading_Python](https://github.com/KumananMahalingam/Trading_Python) | `./` | ML model, prediction service, scripts, tests, this README |
-| [Trading_Platform](https://github.com/KumananMahalingam/Trading_Platform) | `./Trading_Platform/` | Go backend and React frontend |
+Everything lives in this one repository. The trading platform is in
+`Trading_Platform/` (see [Credits and license](#credits-and-license)).
 
 ```
 Trading_Python/
@@ -106,7 +101,7 @@ Trading_Python/
 ├── models/                      Trained bundles + job DB (git-ignored)
 ├── config/                      Legacy pipeline settings
 ├── requirements.txt             Pinned Python dependencies
-└── Trading_Platform/            (separate repo, git-ignored here)
+└── Trading_Platform/            Trading platform
     ├── trading-backend-go/      Go 1.26 + Gin API, migrations, docker-compose.yml
     └── trading-frontend/        React 19 + Vite 8 + lightweight-charts 5
 ```
@@ -137,16 +132,12 @@ changes.
   Crypto prices come from Binance's public API, and model prices from
   yfinance; neither needs a key.
 
-### 2. Get both repositories
+### 2. Clone
 
 ```powershell
 git clone https://github.com/KumananMahalingam/Trading_Python.git
 cd Trading_Python
-git clone https://github.com/KumananMahalingam/Trading_Platform.git
 ```
-
-The Docker setup expects `Trading_Platform` inside `Trading_Python`. If you
-put it elsewhere, set `ML_REPO_DIR` in `trading-backend-go/.env`.
 
 ### 3. Python environment
 
@@ -559,7 +550,7 @@ camelCase.
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:5173` … `5176` | Allowed browser origins |
 | `SEED_SYMBOLS`, `STREAM_MARKET_DATA` | `true` | Startup seeding and live streams |
 | `POSTGRES_HOST_PORT`, `REDIS_HOST_PORT`, `ML_HOST_PORT` | `5432`, `6379`, `8000` | Host ports published by docker compose |
-| `ML_REPO_DIR` | `../..` | Path from `trading-backend-go` to this repo (docker compose) |
+| `ML_REPO_DIR` | `../..` | Path from `trading-backend-go` to the repository root, used to build the ML image (docker compose) |
 
 ---
 
@@ -712,6 +703,8 @@ stdout to UTF-8; for your own scripts, call
 
 ## Credits and license
 
-The trading platform was built by Shubham Gupta and Prince Kumar and is
-MIT-licensed. The ML model, the prediction service and the integration live
-in this repository.
+The trading platform in `Trading_Platform/` is based on a TradingView clone by
+[Shubham Gupta](https://github.com/shubhamgupta0258) and
+[Prince Kumar](https://github.com/princekumar284), used under the MIT License
+(see [`Trading_Platform/LICENSE`](Trading_Platform/LICENSE)). The Go port,
+the ML model, the prediction service and the integration were added on top.

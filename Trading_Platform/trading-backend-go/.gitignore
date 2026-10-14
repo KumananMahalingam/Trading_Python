@@ -1,0 +1,6 @@
+.env
+# Compiled binaries in this folder (go build ./cmd/server). Root-anchored:
+# a bare "server" also matched cmd/server/ and internal/server/.
+/server
+/server.exe
+/out/
