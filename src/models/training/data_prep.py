@@ -85,6 +85,8 @@ def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Frame needs 'date' and 'close' columns")
     frame = df.copy()
     frame['date'] = pd.to_datetime(frame['date'])
+    # A bar without a close is missing data, not a price; filling it would fake a 0% day.
+    frame = frame.dropna(subset=['close'])
     frame = frame.sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
     frame = add_temporal_features(frame)
     frame = add_advanced_features(frame, fill_missing=False)

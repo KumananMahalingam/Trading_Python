@@ -182,7 +182,8 @@ def _direction_counts(predictions, targets):
 
 
 def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
-                     learning_rate=3e-4, device='cpu', train_df=None, patience=30):
+                     learning_rate=3e-4, device='cpu', train_df=None, patience=30,
+                     progress_cb=None):
     """
     Training with proper class balancing and regularization.
 
@@ -190,6 +191,10 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
       1. validation loss improves and min(up, down) precision >= 20%, or
       2. min(up, down) precision reaches a new best >= 25%.
     If neither ever happens, the lowest-validation-loss weights are used.
+
+    ``progress_cb(epochs_done, num_epochs)`` is called after every epoch and
+    once more with ``(num_epochs, num_epochs)`` when training ends (including
+    early stopping).
     """
     print(f"\n{'='*80}")
     print("TRAINING WITH FIXES")
@@ -323,9 +328,15 @@ def train_with_fixes(model, train_loader, val_loader, num_epochs=150,
         else:
             patience_counter += 1
 
+        if progress_cb is not None:
+            progress_cb(epoch + 1, num_epochs)
+
         if patience_counter >= patience:
             print(f"\n⚠️  Early stopping at epoch {epoch+1}")
             break
+
+    if progress_cb is not None:
+        progress_cb(num_epochs, num_epochs)
 
     checkpoint = best if best is not None else lowest_loss
     if best is None:
@@ -371,18 +382,24 @@ def build_model(num_alphas, config, device='cpu'):
 
 
 def train_ensemble_on_prepared(prepared: PreparedData, n_models=3, num_epochs=100,
-                               device='cpu', member_configs=None, batch_size=None):
+                               device='cpu', member_configs=None, batch_size=None,
+                               progress_cb=None):
     """Train ``n_models`` members on one prepared split.
 
+    ``progress_cb(fraction)`` receives overall training progress in [0, 1].
     Returns ``(ensemble, member_configs, histories)``.
     """
     configs = member_configs or default_member_configs(n_models)
     train_loader, val_loader, _ = prepared.make_loaders(batch_size=batch_size)
+    n = len(configs)
 
     models, histories = [], []
     for i, cfg in enumerate(configs):
-        print(f"\nTraining model {i+1}/{len(configs)}...")
+        print(f"\nTraining model {i+1}/{n}...")
         model = build_model(prepared.num_alphas, cfg, device)
+        epoch_cb = None
+        if progress_cb is not None:
+            epoch_cb = lambda done, total, i=i: progress_cb((i + done / total) / n)
         model, history = train_with_fixes(
             model=model,
             train_loader=train_loader,
@@ -391,6 +408,7 @@ def train_ensemble_on_prepared(prepared: PreparedData, n_models=3, num_epochs=10
             learning_rate=cfg['learning_rate'],
             device=device,
             train_df=prepared.train_df,
+            progress_cb=epoch_cb,
         )
         models.append(model)
         histories.append(history)

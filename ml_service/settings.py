@@ -25,6 +25,7 @@ class Settings:
     polygon_api_key: str = field(default="", repr=False)
     groq_api_key: str = field(default="", repr=False)
     internal_token: str = field(default="", repr=False)
+    groq_model: str = "openai/gpt-oss-120b"
 
     # Storage
     model_dir: Path = PROJECT_ROOT / "models"
@@ -33,8 +34,8 @@ class Settings:
     # Data window and rate limiting
     lookback_days: int = 730
     news_batch_size: int = 1000
+    # Minimum seconds between any two Polygon requests (12 s = free tier's 5/minute)
     news_sleep_time: float = 12.0
-    related_companies_sleep_time: float = 15.0
     max_related_companies: int = 5
 
     # Model
@@ -119,12 +120,12 @@ def load_settings(
         polygon_api_key=values.get("POLYGON_API_KEY", "").strip(),
         groq_api_key=values.get("GROQ_API_KEY", "").strip(),
         internal_token=values.get("ML_INTERNAL_TOKEN", "").strip(),
+        groq_model=values.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b",
         model_dir=model_dir,
         jobs_db_path=_path(values, "JOBS_DB_PATH", model_dir / "jobs.db"),
         lookback_days=_int(values, "LOOKBACK_DAYS", 730, minimum=120),
         news_batch_size=_int(values, "NEWS_BATCH_SIZE", 1000),
         news_sleep_time=_float(values, "NEWS_SLEEP_TIME", 12.0),
-        related_companies_sleep_time=_float(values, "RELATED_COMPANIES_SLEEP_TIME", 15.0),
         max_related_companies=_int(values, "MAX_RELATED_COMPANIES", 5, minimum=0),
         window_size=_int(values, "WINDOW_SIZE", 30, minimum=5),
         ensemble_size=_int(values, "ENSEMBLE_SIZE", 3),

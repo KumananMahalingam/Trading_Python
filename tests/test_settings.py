@@ -7,7 +7,7 @@ def test_defaults_without_env():
     s = load_settings(environ={}, env_file=None)
     assert s.lookback_days == 730
     assert s.news_sleep_time == 12.0
-    assert s.related_companies_sleep_time == 15.0
+    assert s.max_related_companies == 5
     assert s.ensemble_size == 3
     assert s.window_size == 30
     assert s.model_dir == PROJECT_ROOT / "models"

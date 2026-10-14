@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -34,21 +34,30 @@ def train_model_bundle(
     batch_size: Optional[int] = None,
     device: str = "cpu",
     extra_meta: Optional[Dict[str, Any]] = None,
+    on_train_progress: Optional[Callable[[float], None]] = None,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> TrainedArtifacts:
     """Prepare data, train the ensemble, and compute the backtest and next-day prediction.
 
+    ``on_stage(name)`` is called when the "train", "backtest" and "predict"
+    stages start; ``on_train_progress(fraction)`` reports training in [0, 1].
     Nothing is written to disk; pass the result to ``artifacts.save_bundle``.
     """
     info = resolve_ticker(ticker)
+    stage = on_stage or (lambda name: None)
+
+    stage("train")
     prepared = prepare_training_data(feature_df, alpha_text, window_size=window_size)
     ensemble, configs, histories = train_ensemble_on_prepared(
         prepared, n_models=n_models, num_epochs=num_epochs, device=device,
-        member_configs=member_configs, batch_size=batch_size,
+        member_configs=member_configs, batch_size=batch_size, progress_cb=on_train_progress,
     )
     ensemble.eval()
 
     trained_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    stage("backtest")
     backtest = run_backtest(ensemble, prepared, mc_samples, device=device)
+    stage("predict")
     prediction = predict_forward(ensemble, prepared, prepared.scalers, mc_samples,
                                  is_crypto=info.is_crypto, trained_at=trained_at, device=device)
 
