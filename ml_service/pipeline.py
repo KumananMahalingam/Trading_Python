@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from ml_service import artifacts
+from ml_service.errors import UserFacingError
 from ml_service.inference import predict_next
 from ml_service.news_cache import update_news, window_start
 from ml_service.settings import Settings
@@ -49,7 +50,7 @@ _PEER_PATTERN = re.compile(r"^[A-Z]{1,5}$")
 _STOCK_CLOSE_SETTLE = (16, 15)
 
 
-class PipelineError(RuntimeError):
+class PipelineError(UserFacingError):
     """Expected failure with a message that is safe to show to users."""
 
 
