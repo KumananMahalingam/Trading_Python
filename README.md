@@ -1,17 +1,11 @@
 # Trading_Python
 
 A dual-stream LSTM that predicts next-day price moves from price action, news
-sentiment and LLM-written alpha signals, plugged into a TradingView-style
+sentiment and LLM-written alpha signals, plugged into a
 trading platform (Go + React). On the chart, users can see the model's
 next-day forecast and how it did over its backtest. From the same panel they
 can refresh the prediction with the latest data or retrain the model on any
 supported stock or crypto pair, then follow the run's progress live.
-
-> **Research code, not trading advice.** Next-day returns are close to
-> unpredictable, and the trained models here mostly do not beat a naive
-> "always guess the more common direction" baseline (see
-> [Pre-trained models](#pre-trained-models)). Treat this as a
-> feature-engineering and systems project, not a strategy.
 
 ---
 
@@ -22,7 +16,6 @@ supported stock or crypto pair, then follow the run's progress live.
 - [Quick start](#quick-start)
 - [Running everything in Docker](#running-everything-in-docker)
 - [Using the app](#using-the-app)
-- [Pre-trained models](#pre-trained-models)
 - [How the model works](#how-the-model-works)
 - [Prediction service (`ml_service`)](#prediction-service-ml_service)
 - [Trading platform](#trading-platform)
@@ -248,40 +241,6 @@ docker compose --profile app down              # stop (data volumes are kept)
 
 ---
 
-## Pre-trained models
-
-Trained with `scripts/train_batch.py` on a rolling 2-year window ending
-2026-10-13, using Groq alphas. Accuracy is next-day direction on the
-held-out final 15% of days. The **baseline** is always guessing that period's
-more common direction.
-
-| Ticker | Test accuracy | Baseline | Peers found from news |
-| --- | --- | --- | --- |
-| AAPL | 36.2% | 56.5% | MSFT, AMZN, GOOG, INTC, META |
-| AMZN | 55.1% | 60.9% | MSFT, GOOG, META, AAPL, NVDA |
-| JPM | 42.0% | 56.5% | NDAQ, AXP, SOFI, AAPL, MSFT |
-| PEP | 54.7% | 56.2% | CCEP, PG, NDAQ, AMZN, TGT |
-| TM | 42.9% | 50.8% | TSLA, BYD, DAL, GM, BA |
-| MSFT | 46.4% | 59.4% | AMZN, AAPL, META, GOOG, NVDA |
-| BTCUSDT | 53.4% | 52.4% | none (IBIT news only) |
-
-Several models lean heavily toward predicting DOWN. AAPL, for example,
-called only 10% of up days correctly. JPM and PEP were trained before
-exchange operators were excluded from peers, so they include NDAQ; a retrain
-fixes that.
-
-Retrain the set (about 25 min per ticker on CPU with free-tier Polygon):
-
-```powershell
-.\.venv-win\Scripts\python.exe scripts\train_batch.py --log batch.log                 # AAPL AMZN JPM PEP TM
-.\.venv-win\Scripts\python.exe scripts\train_batch.py --tickers MSFT BTCUSDT --log batch.log
-```
-
-The batch uses the service's own job queue, so it is safe to run while the
-service is up. Its measured stage times also become the ETAs the UI shows.
-
----
-
 ## How the model works
 
 ### Pipeline (per ticker)
@@ -421,10 +380,6 @@ the service is running, so the queue and ETAs stay accurate.
 ---
 
 ## Trading platform
-
-The TradingView clone in `Trading_Platform`, originally built by
-[Shubham Gupta](https://github.com/shubhamgupta0258) and
-[Prince Kumar](https://github.com/princekumar284).
 
 **Features**
 - Register, log in and log out. JWT access tokens (1 h) plus a refresh token
@@ -701,10 +656,3 @@ stdout to UTF-8; for your own scripts, call
 
 ---
 
-## Credits and license
-
-The trading platform in `Trading_Platform/` is based on a TradingView clone by
-[Shubham Gupta](https://github.com/shubhamgupta0258) and
-[Prince Kumar](https://github.com/princekumar284), used under the MIT License
-(see [`Trading_Platform/LICENSE`](Trading_Platform/LICENSE)). The Go port,
-the ML model, the prediction service and the integration were added on top.
