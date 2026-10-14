@@ -9,8 +9,16 @@
   enforced by a partial unique index.
 * A user may own at most one queued/running job. Joining someone else's job
   doesn't count against the limit, because it adds no work.
-* On startup, jobs left ``running`` by a previous process are marked failed;
-  ``queued`` jobs are kept and run.
+* A running job records its worker's process id and writes a heartbeat every
+  ``stale_after / 4`` seconds. A ``running`` job is marked failed (checked on
+  startup and before every job) when its heartbeat is older than
+  ``stale_after`` *and* the owning process is gone, or when the heartbeat is
+  older than ``abandon_after`` regardless. The process check matters on
+  laptops: during sleep (Windows Modern Standby) heartbeats stop but the
+  worker resumes afterwards and must not lose its job. Several processes can
+  share one database, e.g. the service and ``scripts/train_batch.py``; the
+  claim step still guarantees one job at a time across all of them.
+  ``queued`` jobs survive restarts.
 
 ETAs
 ----
@@ -24,7 +32,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import socket
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -72,7 +83,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at       REAL NOT NULL,
     started_at       REAL,
     stage_started_at REAL,
-    finished_at      REAL
+    finished_at      REAL,
+    heartbeat_at     REAL,
+    worker_pid       INTEGER,
+    worker_host      TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs (status, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_ticker_kind
@@ -137,6 +151,60 @@ class JobStatus:
         return asdict(self)
 
 
+def process_alive(pid: int) -> bool:
+    """Whether a process with ``pid`` is running on this machine.
+
+    On Windows ``os.kill(pid, 0)`` would *terminate* the process, so the
+    Win32 API is queried instead.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5             # access denied: exists, not ours
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259                        # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@contextmanager
+def keep_awake():
+    """Ask Windows not to sleep while a job runs (no-op elsewhere).
+
+    Uses SetThreadExecutionState on the calling thread; the request is
+    released when the block exits. The display may still turn off, and a
+    lid close or battery policy can still force sleep.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    try:
+        yield
+    finally:
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+
 def _iso(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
@@ -155,6 +223,9 @@ class JobManager:
         progress_interval: float = 1.0,
         poll_interval: float = 2.0,
         retention_days: float = 30,
+        stale_after: float = 120.0,
+        abandon_after: float = 6 * 3600.0,
+        pid_alive: Optional[Callable[[int], bool]] = None,
     ):
         self._runner = runner
         self._has_model = has_model
@@ -163,6 +234,12 @@ class JobManager:
         self._history = history
         self._progress_interval = progress_interval
         self._poll_interval = poll_interval
+        self._stale_after = stale_after
+        self._abandon_after = abandon_after
+        self._heartbeat_interval = stale_after / 4
+        self._pid_alive = pid_alive or process_alive
+        self._pid = os.getpid()
+        self._host = socket.gethostname()
 
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +254,11 @@ class JobManager:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
-        self._recover_interrupted()
+            columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+            for name, sql_type in (("heartbeat_at", "REAL"), ("worker_pid", "INTEGER"), ("worker_host", "TEXT")):
+                if name not in columns:            # databases created by earlier versions
+                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
+        self._recover_stale()
         self._prune(retention_days)
         self._averages = {(kind, stage): self._load_average(kind, stage)
                           for kind, stages in self._defaults.items() for stage in stages}
@@ -196,14 +277,32 @@ class JobManager:
             else:
                 self._conn.execute("COMMIT")
 
-    def _recover_interrupted(self) -> None:
+    def _is_dead(self, row: sqlite3.Row, now: float) -> bool:
+        beat = row["heartbeat_at"]
+        if beat is not None and beat >= now - self._stale_after:
+            return False                                   # heartbeat is fresh
+        if beat is not None and beat < now - self._abandon_after:
+            return True                                    # silent for hours
+        pid, host = row["worker_pid"], row["worker_host"]
+        if pid is None:
+            return True                                    # legacy row, no owner to check
+        if host != self._host:
+            return False                                   # can't see other machines' processes
+        # Stale heartbeat but the owner is still alive: most likely the machine slept.
+        return not self._pid_alive(int(pid))
+
+    def _recover_stale(self) -> None:
+        """Fail running jobs whose worker process is gone."""
+        now = self._clock()
         with self._tx() as c:
-            n = c.execute(
-                "UPDATE jobs SET status=?, error=?, message=NULL, finished_at=? WHERE status=?",
-                (FAILED, INTERRUPTED_MESSAGE, self._clock(), RUNNING),
-            ).rowcount
-        if n:
-            log.warning("Marked %d interrupted job(s) as failed", n)
+            rows = c.execute("SELECT id, heartbeat_at, worker_pid, worker_host FROM jobs WHERE status=?",
+                             (RUNNING,)).fetchall()
+            dead = [r["id"] for r in rows if self._is_dead(r, now)]
+            for job_id in dead:
+                c.execute("UPDATE jobs SET status=?, error=?, message=NULL, finished_at=? WHERE id=? AND status=?",
+                          (FAILED, INTERRUPTED_MESSAGE, now, job_id, RUNNING))
+        if dead:
+            log.warning("Marked %d interrupted job(s) as failed", len(dead))
 
     def _prune(self, retention_days: float) -> None:
         cutoff = self._clock() - retention_days * 86400
@@ -218,11 +317,13 @@ class JobManager:
 
     # ---------------------------------------------------------------- submit
 
-    def submit(self, ticker: str, kind: str, user_id: str) -> Tuple[JobStatus, bool]:
+    def submit(self, ticker: str, kind: str, user_id: str,
+               limit_per_user: bool = True) -> Tuple[JobStatus, bool]:
         """Queue a job, or return the active job for the same (ticker, kind).
 
         Returns ``(job, created)``. Raises :class:`InvalidJobError` or
-        :class:`JobConflictError`.
+        :class:`JobConflictError`. ``limit_per_user=False`` is for operator
+        tools (batch training), never for end-user requests.
         """
         if kind not in KINDS:
             raise InvalidJobError(f"kind must be one of {', '.join(KINDS)}")
@@ -246,10 +347,12 @@ class JobManager:
             if existing is not None:
                 job_id = existing["id"]
             else:
-                mine = c.execute(
-                    "SELECT id FROM jobs WHERE user_id=? AND status IN (?, ?) ORDER BY seq LIMIT 1",
-                    (user, *ACTIVE),
-                ).fetchone()
+                mine = None
+                if limit_per_user:
+                    mine = c.execute(
+                        "SELECT id FROM jobs WHERE user_id=? AND status IN (?, ?) ORDER BY seq LIMIT 1",
+                        (user, *ACTIVE),
+                    ).fetchone()
                 if mine is not None:
                     conflict_id = mine["id"]
                 else:
@@ -406,7 +509,12 @@ class JobManager:
                 self._wake.wait(self._poll_interval)
 
     def run_next(self) -> bool:
-        """Run the oldest queued job to completion. Returns False if the queue is empty."""
+        """Run the oldest queued job to completion.
+
+        Returns False if nothing was run: the queue is empty, or another
+        worker (possibly in another process) is running a job.
+        """
+        self._recover_stale()
         now = self._clock()
         with self._tx() as c:
             if c.execute("SELECT 1 FROM jobs WHERE status=?", (RUNNING,)).fetchone():
@@ -415,16 +523,21 @@ class JobManager:
             if row is None:
                 return False
             c.execute(
-                "UPDATE jobs SET status=?, started_at=?, stage_started_at=?, stage=NULL, "
-                "stage_progress=0, progress=0, message=NULL WHERE id=?",
-                (RUNNING, now, now, row["id"]),
+                "UPDATE jobs SET status=?, started_at=?, stage_started_at=?, heartbeat_at=?, worker_pid=?, "
+                "worker_host=?, stage=NULL, stage_progress=0, progress=0, message=NULL WHERE id=?",
+                (RUNNING, now, now, now, self._pid, self._host, row["id"]),
             )
 
         job_id, kind, ticker = row["id"], row["kind"], row["ticker"]
         log.info("Starting %s job %s for %s", kind, job_id, ticker)
         tracker = _ProgressTracker(self, job_id, kind, now)
+        stop_heartbeat = threading.Event()
+        heartbeat = threading.Thread(target=self._heartbeat, args=(job_id, stop_heartbeat),
+                                     name=f"ml-job-heartbeat-{job_id[:8]}", daemon=True)
+        heartbeat.start()
         try:
-            result = self._runner(kind, ticker, tracker)
+            with keep_awake():
+                result = self._runner(kind, ticker, tracker)
         except UserFacingError as exc:
             self._finish(job_id, FAILED, error=str(exc))
             log.warning("%s job %s for %s failed: %s", kind, job_id, ticker, exc)
@@ -435,17 +548,37 @@ class JobManager:
             tracker.complete()
             self._finish(job_id, SUCCEEDED, result=result)
             log.info("%s job %s for %s succeeded", kind, job_id, ticker)
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=5)
         return True
+
+    def _heartbeat(self, job_id: str, stop: threading.Event) -> None:
+        while not stop.wait(self._heartbeat_interval):
+            try:
+                with self._tx() as c:
+                    c.execute("UPDATE jobs SET heartbeat_at=? WHERE id=? AND status=?",
+                              (self._clock(), job_id, RUNNING))
+            except Exception:
+                log.exception("Heartbeat failed for job %s", job_id)
+
+    def result(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Runner result stored for a succeeded job (operator tools only; not part of the API)."""
+        with self._lock:
+            row = self._conn.execute("SELECT result FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise JobNotFoundError(job_id)
+        return json.loads(row["result"]) if row["result"] else None
 
     # ----------------------------------------------------------- bookkeeping
 
     def _update_progress(self, job_id: str, event: Any, stage_started_at: float) -> None:
         with self._tx() as c:
             c.execute(
-                "UPDATE jobs SET stage=?, stage_progress=?, progress=?, message=?, stage_started_at=? "
-                "WHERE id=? AND status=?",
+                "UPDATE jobs SET stage=?, stage_progress=?, progress=?, message=?, stage_started_at=?, "
+                "heartbeat_at=? WHERE id=? AND status=?",
                 (event.stage, float(event.stage_progress), float(event.progress),
-                 getattr(event, "message", None), stage_started_at, job_id, RUNNING),
+                 getattr(event, "message", None), stage_started_at, self._clock(), job_id, RUNNING),
             )
 
     def _record_stage(self, kind: str, stage: str, seconds: float) -> None:
@@ -460,13 +593,18 @@ class JobManager:
     def _finish(self, job_id: str, status: str, error: Optional[str] = None,
                 result: Optional[Dict[str, Any]] = None) -> None:
         payload = json.dumps(result, default=str) if result is not None else None
+        # Guarded by status: a job that was already failed as abandoned is not resurrected.
         with self._tx() as c:
             if status == SUCCEEDED:
-                c.execute("UPDATE jobs SET status=?, progress=100, stage_progress=1, finished_at=?, "
-                          "result=?, error=NULL WHERE id=?", (status, self._clock(), payload, job_id))
+                n = c.execute("UPDATE jobs SET status=?, progress=100, stage_progress=1, finished_at=?, "
+                              "result=?, error=NULL WHERE id=? AND status=?",
+                              (status, self._clock(), payload, job_id, RUNNING)).rowcount
             else:
-                c.execute("UPDATE jobs SET status=?, finished_at=?, error=? WHERE id=?",
-                          (status, self._clock(), error, job_id))
+                n = c.execute("UPDATE jobs SET status=?, finished_at=?, error=? WHERE id=? AND status=?",
+                              (status, self._clock(), error, job_id, RUNNING)).rowcount
+        if n == 0:
+            log.warning("Job %s was no longer running when it finished (%s); status left unchanged",
+                        job_id, status)
 
 
 class _ProgressTracker:
@@ -503,17 +641,21 @@ class _ProgressTracker:
 
 # --------------------------------------------------------------------- wiring
 
-def pipeline_runner(settings) -> Runner:
-    """Runner that executes the real train/refresh pipelines."""
+def pipeline_runner(settings, overrides=None) -> Runner:
+    """Runner that executes the real train/refresh pipelines.
+
+    ``overrides`` (``pipeline.TrainOverrides``) shortens training for smoke runs.
+    """
     def run(kind: str, ticker: str, progress_cb):
         from ml_service.pipeline import run_job
-        return run_job(kind, ticker, settings, progress_cb=progress_cb)
+        return run_job(kind, ticker, settings, progress_cb=progress_cb, overrides=overrides)
     return run
 
 
-def create_job_manager(settings, **kwargs) -> JobManager:
+def create_job_manager(settings, runner: Optional[Runner] = None, **kwargs) -> JobManager:
     def has_model(ticker: str) -> bool:
         from ml_service.artifacts import has_bundle
         return has_bundle(settings.model_dir, ticker)
 
-    return JobManager(settings.jobs_db_path, pipeline_runner(settings), has_model=has_model, **kwargs)
+    return JobManager(settings.jobs_db_path, runner or pipeline_runner(settings),
+                      has_model=has_model, **kwargs)

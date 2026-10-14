@@ -401,3 +401,19 @@ def test_feature_frame_never_fills_missing_prices():
     frame = build_feature_frame(df)
     assert frame["date"].iloc[-1] == pd.Timestamp("2026-01-04")
     assert frame["close"].notna().all()
+
+
+def test_exchange_operators_are_never_peers():
+    from collections import Counter
+    from ml_service.ticker_mapping import resolve_ticker
+
+    class Src(FakeSources):
+        def validate_peer(self, ticker):
+            self.validated.append(ticker)
+            return True, "Valid"
+
+    src = Src()
+    mentions = Counter({"NDAQ": 900, "ICE": 500, "SPGI": 400, "MSFT": 300, "NVDA": 200})
+    peers = pipeline._discover_peers(src, resolve_ticker("JPM"), mentions, "JPMORGAN CHASE", 2, lambda f: None)
+    assert peers == ["MSFT", "NVDA"]
+    assert not set(src.validated) & pipeline.EXCLUDED_PEERS

@@ -44,6 +44,10 @@ REFRESH_STAGES: Tuple[Tuple[str, float], ...] = (
 STAGES = {"train": TRAIN_STAGES, "refresh": REFRESH_STAGES}
 
 MAX_PEER_CANDIDATES = 20
+# Exchange / index operators. Headlines mention "Nasdaq", "NYSE", "S&P 500" or
+# "the Dow" constantly; name matching resolves those to these companies, which
+# made NDAQ a "peer" of JPM and PEP in the first batch run.
+EXCLUDED_PEERS = frozenset({"NDAQ", "ICE", "SPGI", "DOW", "DJT", "CME", "CBOE", "MSCI"})
 # Feature column names are used verbatim inside alpha formulas, so peers must be plain tickers.
 _PEER_PATTERN = re.compile(r"^[A-Z]{1,5}$")
 # A daily stock bar is treated as final this long after the 16:00 ET close.
@@ -157,8 +161,9 @@ def _discover_peers(sources: DataSources, info: TickerInfo, mentions, company_na
     from src.utils.helpers import is_same_company
 
     peers: List[str] = []
-    candidates = [(t, c) for t, c in mentions.most_common(MAX_PEER_CANDIDATES)
-                  if t != info.base and _PEER_PATTERN.match(t)]
+    ranked = [(t, c) for t, c in mentions.most_common()
+              if t != info.base and t not in EXCLUDED_PEERS and _PEER_PATTERN.match(t)]
+    candidates = ranked[:MAX_PEER_CANDIDATES]
     for i, (ticker, count) in enumerate(candidates):
         if len(peers) >= max_peers:
             break
