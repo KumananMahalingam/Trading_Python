@@ -1,0 +1,22 @@
+# Build context for ml_service/Dockerfile: keep it to the code the service needs.
+.git
+.venv
+.venv-win
+**/__pycache__
+**/*.pyc
+.pytest_cache
+models
+Trading_Platform
+tests
+scripts
+prediction_graphs*
+*.png
+*.xlsx
+*.csv
+*.pth
+*.db
+*.log
+.env
+**/.env
+config/secret_key.py
+sec-edgar-filings

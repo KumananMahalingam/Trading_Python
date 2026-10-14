@@ -1,536 +1,717 @@
-# Trading_Platform
+# Trading_Python
 
-A research pipeline for next-day stock return prediction. It fuses **price
-action, news sentiment, macroeconomic data, and SEC filings** into a
-dual-stream LSTM with attention, using an LLM to author the alpha signals.
+A dual-stream LSTM that predicts next-day price moves from price action, news
+sentiment and LLM-written alpha signals, plugged into a TradingView-style
+trading platform (Go + React). On the chart, users can see the model's
+next-day forecast and how it did over its backtest. From the same panel they
+can refresh the prediction with the latest data or retrain the model on any
+supported stock or crypto pair, then follow the run's progress live.
 
-<img width="5964" height="4164" alt="image" src="https://github.com/user-attachments/assets/f2235908-df98-4fa4-8ac0-eaf524e575de" />
-
-> **Research code, not trading advice.** Next-day equity returns are close to
-> unpredictable. Treat this as a feature-engineering and architecture testbed,
-> not a strategy to allocate capital against. See
-> [Interpreting results](#interpreting-results).
+> **Research code, not trading advice.** Next-day returns are close to
+> unpredictable, and the trained models here mostly do not beat a naive
+> "always guess the more common direction" baseline (see
+> [Pre-trained models](#pre-trained-models)). Treat this as a
+> feature-engineering and systems project, not a strategy.
 
 ---
 
-## Table of contents
+## Contents
 
-- [How it works](#how-it-works)
+- [How it fits together](#how-it-fits-together)
 - [Repository layout](#repository-layout)
-- [Setup](#setup)
-- [Running the pipeline](#running-the-pipeline)
-- [Architecture](#architecture)
-- [Technical decisions](#technical-decisions)
+- [Quick start](#quick-start)
+- [Running everything in Docker](#running-everything-in-docker)
+- [Using the app](#using-the-app)
+- [Pre-trained models](#pre-trained-models)
+- [How the model works](#how-the-model-works)
+- [Prediction service (`ml_service`)](#prediction-service-ml_service)
+- [Trading platform](#trading-platform)
+- [API reference](#api-reference)
 - [Configuration reference](#configuration-reference)
-- [Outputs](#outputs)
+- [Testing](#testing)
+- [Security](#security)
 - [Interpreting results](#interpreting-results)
-- [Known issues and rough edges](#known-issues-and-rough-edges)
+- [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
+- [Legacy research pipeline](#legacy-research-pipeline)
+- [Credits and license](#credits-and-license)
 
 ---
 
-## How it works
+## How it fits together
 
 ```
-                 ┌─ Polygon news ──► VADER sentiment ──► spaCy NER ──► related companies
-                 │
-Yahoo Finance ───┼─ OHLCV ─────────► technical indicators ─┐
-   (yfinance)    │                                         │
-                 ├─ FRED (52 series) ──► macro features ────┼──► feature engineering
-                 │                                         │         + selection
-                 └─ SEC EDGAR 10-K/Q ──► MD&A sentiment ────┘              │
-                                                                           ▼
-                                          Groq LLM ──► alpha formulas ──► alpha columns
-                                                                           │
-                                                                           ▼
-                                    dual-stream LSTM + attention + TCN ──► next-day return
-                                                  (ensemble, MC dropout)
+ Browser (React + lightweight-charts, :5173)
+   │  JWT
+   ▼
+ Go backend (Gin, :8080) ── Postgres (users, symbols, candles, trades) ── Redis (sessions, caches)
+   │  X-Internal-Token, user id
+   ▼
+ ML service (FastAPI, 127.0.0.1:8000)
+   ├── job queue (SQLite, one worker, one job at a time)
+   ├── pipeline: news → peers → prices → alphas → train → backtest → predict
+   │      Polygon news · yfinance prices · Groq LLM · VADER · spaCy · PyTorch
+   └── models/{TICKER}/  weights, scalers, metadata, backtest, latest prediction
 ```
 
-Pipeline phases, as implemented in `scripts/run_pipeline.py`:
+A typical run:
 
-1. **News + entities** — fetch articles per ticker, score with VADER, extract
-   `ORG` entities with spaCy, and validate them against an SEC ticker file.
-2. **Related companies** — rank validated mentions, filter by market cap and
-   exchange, then fetch sentiment for the top peers.
-3. **Macro + alternative data** — FRED economic series, SEC MD&A sentiment, and
-   earnings-surprise scores.
-4. **Prices** — daily OHLCV via `yfinance`.
-5. **Alphas** — ask Groq for formulas over the assembled feature set, then parse
-   and evaluate them into `alpha_1..alpha_5` columns.
-6. **Train** — feature selection, scaling, dual-stream LSTM ensemble training,
-   evaluation, and plots.
-
-Everything collected is cached to a single Excel workbook so later runs can skip
-the (slow, rate-limited) API calls.
+1. The user opens a ticker on the 1D chart and turns on **Model prediction**.
+2. The frontend calls `GET /api/predictions/{ticker}`. The Go backend checks
+   the JWT and that the symbol exists, then asks the ML service, which answers
+   from the stored model bundle.
+3. **Refresh** or **Retrain** calls `POST /api/predictions/{ticker}/jobs`. The
+   ML service queues the job (or joins an identical one already queued). Its
+   single worker runs the pipeline and records stage, progress and ETA.
+4. The browser polls `GET /api/prediction-jobs/{id}` every 3 s. When the job
+   finishes, it refetches the prediction and redraws the chart overlay.
 
 ---
 
 ## Repository layout
 
+There are two git repositories. The trading platform lives inside this one
+as `Trading_Platform/` and is excluded by this repo's `.gitignore`:
+
+| Repository | Path | Contents |
+| --- | --- | --- |
+| [Trading_Python](https://github.com/KumananMahalingam/Trading_Python) | `./` | ML model, prediction service, scripts, tests, this README |
+| [Trading_Platform](https://github.com/KumananMahalingam/Trading_Platform) | `./Trading_Platform/` | Go backend and React frontend |
+
 ```
-scripts/
-  run_pipeline.py          The only working entry point (collect -> train -> report)
-
-config/
-  settings.py              Active configuration (currently holds FAST-MODE values)
-  settings_fast.py         Reduced-cost preset
-  secret_key.py            API keys (git-ignored, NOT committed)
-
-src/
-  data/
-    collectors/
-      stock_collector.py     yfinance OHLCV + ticker quality checks
-      news_collector.py      Polygon.io news, paginated with sleeps
-      fred_collector.py      52 FRED macro series
-      sec_collector.py       SEC 10-K/10-Q MD&A + earnings surprise
-    processors/
-      technical_indicators.py  ~30 indicators (SMA/EMA/MACD/RSI/BB/ATR/OBV/MFI/ADX/...)
-      sentiment_analyzer.py    VADER scoring + spaCy ORG extraction
-      company_validator.py     Ticker/name resolution and fuzzy matching
-    storage/
-      excel_handler.py         Read/write the 6-sheet Excel cache
-      cache_manager.py         Cache completeness checks
-
-  features/
-    alpha_generator.py       Groq prompt + static fallback formulas
-    alpha_computer.py        Parse and evaluate alpha formula text
-    feature_engineering.py   Derived features, sentiment lags, target creation
-    feature_selector.py      Correlation / mutual-information selection
-
-  models/
-    architectures/
-      lstm_modules.py        ResidualLSTM, MultiHeadAttention, TCNBlock
-      dual_stream_lstm.py    ImprovedDualStreamLSTM
-      ensemble.py            ModelEnsemble with learnable softmax weights
-    training/
-      dataset.py             Windowing + augmentation
-      losses.py              HybridLoss + class-balanced construction
-      trainer.py             Data prep, training loop, ensemble training
-    evaluation/
-      evaluator.py           MC-dropout inference
-      metrics.py             Performance metrics
-
-  prediction/
-    predictor.py             Load models, make a live prediction
-    batch_predictor.py       Predict across many tickers
-
-  visualization/
-    training_plots.py        Loss/accuracy/LR curves
-    prediction_plots.py      Predictions with uncertainty, error analysis
-    stock_price_plots.py     Reconstructed price paths
-
-  utils/
-    constants.py             Default hyperparameters (reference values)
-    helpers.py               Date/name/formatting utilities
-
+Trading_Python/
+├── ml_service/                  Prediction service
+│   ├── app.py                   FastAPI app (HTTP API, token auth, worker lifecycle)
+│   ├── jobs.py                  SQLite job queue, single worker, ETAs, heartbeats
+│   ├── pipeline.py              Non-interactive train / refresh pipelines + progress
+│   ├── training.py              Train an ensemble and package it as a bundle
+│   ├── inference.py             Next-day prediction, backtest, uncertainty
+│   ├── artifacts.py             Bundle save/load (atomic), JSON scalers
+│   ├── news_cache.py            Per-ticker sentiment + mention cache
+│   ├── sources.py               Polygon / yfinance / Groq / VADER / spaCy adapters
+│   ├── ticker_mapping.py        Platform tickers → provider symbols
+│   ├── settings.py              Environment configuration
+│   ├── cli.py                   python -m ml_service.cli train|refresh TICKER
+│   ├── Dockerfile, run.ps1, .env.example
+├── src/                         Model code (features, LSTM, training, evaluation)
+├── scripts/
+│   ├── train_batch.py           Train/refresh several tickers through the job queue
+│   ├── smoke_e2e.py             End-to-end check through the Go backend
+│   ├── check_news_coverage.py   How much Polygon news exists for a ticker
+│   ├── show_splits.py           Print the train/val/test date ranges
+│   ├── demo_bundle.py           Train → save → reload → predict, quickly
+│   ├── demo_jobs.py             Job queue demo with a fake runner
+│   └── run_pipeline.py          Legacy interactive research pipeline
+├── tests/                       pytest suite
+├── models/                      Trained bundles + job DB (git-ignored)
+├── config/                      Legacy pipeline settings
+├── requirements.txt             Pinned Python dependencies
+└── Trading_Platform/            (separate repo, git-ignored here)
+    ├── trading-backend-go/      Go 1.26 + Gin API, migrations, docker-compose.yml
+    └── trading-frontend/        React 19 + Vite 8 + lightweight-charts 5
 ```
 
 ---
 
-## Setup
+## Quick start
 
-### Prerequisites
+These commands are for Windows PowerShell, which is what the project has been
+run on. The same steps work on macOS/Linux with the usual path and activation
+changes.
 
-- Python 3.11 (the cached bytecode targets 3.11)
-- ~1 GB disk for SEC filings and the Excel cache
-- A CUDA GPU is optional; the pipeline falls back to CPU
+### 1. Prerequisites
 
-### Install
+- Python 3.11
+- Go 1.26+
+- Node.js 20+ (tested on 24)
+- Docker Desktop (for PostgreSQL, Redis and Flyway)
+- API keys:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+  | Key | Service | Used for |
+  | --- | --- | --- |
+  | `POLYGON_API_KEY` | [Polygon.io](https://polygon.io) (free tier works) | News for sentiment |
+  | `GROQ_API_KEY` | [Groq](https://console.groq.com) | LLM alpha formulas |
+  | `FINNHUB_API_KEY` | [Finnhub](https://finnhub.io) | Stock prices, symbols, platform news |
+  | `ALPHA_VANTAGE_API_KEY` | [Alpha Vantage](https://www.alphavantage.co) | Daily stock candles on the chart |
 
+  Crypto prices come from Binance's public API, and model prices from
+  yfinance; neither needs a key.
+
+### 2. Get both repositories
+
+```powershell
+git clone https://github.com/KumananMahalingam/Trading_Python.git
+cd Trading_Python
+git clone https://github.com/KumananMahalingam/Trading_Platform.git
+```
+
+The Docker setup expects `Trading_Platform` inside `Trading_Python`. If you
+put it elsewhere, set `ML_REPO_DIR` in `trading-backend-go/.env`.
+
+### 3. Python environment
+
+```powershell
+python -m venv .venv-win
+.\.venv-win\Scripts\Activate.ps1
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.10.0   # CPU build; skip for CUDA
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-> **Heads up:** `requirements.txt` is currently wrapped in `"""` triple quotes,
-> which makes `pip install -r` fail. Delete the first and last lines, or install
-> the packages directly:
->
-> ```bash
-> pip install "torch>=2.0.0" "pandas>=2.0.0" "numpy>=1.24.0" "openpyxl>=3.1.0" \
->   "yfinance>=0.2.28" "polygon-api-client>=1.12.0" "vaderSentiment>=3.3.2" \
->   "spacy>=3.6.0" "scikit-learn>=1.3.0" "matplotlib>=3.7.0" "scipy>=1.11.0" \
->   "fredapi>=0.5.0" "groq>=0.4.0" "sec-edgar-downloader>=5.0.0"
-> ```
+### 4. Configure
 
-### API keys
-
-Three services are used. Create `config/secret_key.py` (already git-ignored):
-
-```python
-API_KEY = "..."        # Polygon.io  - news articles
-GROQ_API_KEY = "..."   # Groq        - LLM alpha generation
-FRED_API_KEY = "..."   # FRED        - macroeconomic series
+```powershell
+Copy-Item ml_service\.env.example ml_service\.env
+Copy-Item Trading_Platform\trading-backend-go\.env.example Trading_Platform\trading-backend-go\.env
 ```
 
-| Key | Service | Free tier | Needed for |
-| --- | ------- | --------- | ---------- |
-| `API_KEY` | [Polygon.io](https://polygon.io) | Yes, rate-limited | News + sentiment |
-| `GROQ_API_KEY` | [Groq](https://console.groq.com) | Yes | LLM alpha formulas |
-| `FRED_API_KEY` | [FRED](https://fred.stlouisfed.org/docs/api/api_key.html) | Yes | Macro features |
+- `ml_service/.env`: set `POLYGON_API_KEY`, `GROQ_API_KEY`, and
+  `ML_INTERNAL_TOKEN`. For the token, use a long random string, for example
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- `trading-backend-go/.env`: set `JWT_SECRET` (at least 32 characters),
+  `FINNHUB_API_KEY`, `ALPHA_VANTAGE_API_KEY`, and the **same**
+  `ML_INTERNAL_TOKEN`.
 
-Yahoo Finance (`yfinance`) and SEC EDGAR need no key.
+Both files are git-ignored.
 
-> **Security:** `secret_key.py` stores keys as plaintext literals. It is
-> git-ignored and currently untracked (verified), so it is not in the repo — but
-> anyone with filesystem access can read it, and it is easy to commit by
-> accident with `git add -f`. Prefer environment variables:
->
-> ```python
-> import os
-> API_KEY = os.environ["POLYGON_API_KEY"]
-> GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-> FRED_API_KEY = os.environ["FRED_API_KEY"]
-> ```
->
-> If any of these keys has ever been pasted into a chat, issue, or commit,
-> **rotate it** in the provider console.
+### 5. Start PostgreSQL and Redis
 
-Also update the SEC downloader identity in
-`src/data/collectors/sec_collector.py`, which ships with the placeholder
-`Downloader("MyCompany", "myemail@example.com")`. SEC asks for a real contact.
+```powershell
+cd Trading_Platform\trading-backend-go
+docker compose up -d
+docker compose logs flyway      # "Successfully applied ..." or "Schema is up to date"
+```
+
+If ports 5432 or 6379 are taken, see [Troubleshooting](#troubleshooting).
+
+### 6. Start the three services (three terminals)
+
+```powershell
+# ML service → http://127.0.0.1:8000
+.\ml_service\run.ps1
+
+# Go backend → http://localhost:8080   (loads .env, then go run ./cmd/server)
+cd Trading_Platform\trading-backend-go; .\run.ps1
+
+# Frontend → http://localhost:5173
+cd Trading_Platform\trading-frontend; npm install; npm run dev
+```
+
+Then open http://localhost:5173, register, and open a chart.
+
+### 7. Check the whole path
+
+```powershell
+.\.venv-win\Scripts\python.exe scripts\smoke_e2e.py      # registers a user, refreshes AAPL, ~70 s
+```
 
 ---
 
-## Running the pipeline
+## Running everything in Docker
 
-```bash
-python scripts/run_pipeline.py
+`trading-backend-go/docker-compose.yml` can also run the ML service and the
+Go backend. The frontend still runs with `npm run dev`.
+
+```powershell
+cd Trading_Platform\trading-backend-go
+docker compose --profile ml up -d --build      # infra + ML service only
+docker compose --profile app up -d --build     # infra + ML service + Go backend
+docker compose --profile app down              # stop (data volumes are kept)
 ```
 
-There are **no CLI arguments** — all configuration comes from
-`config/settings.py`. The script is interactive: when it finds a usable cache it
-prompts
-
-```
-Load data from cache? (yes/no) [yes]:
-```
-
-Answering yes skips news, price, and peer collection (minutes of rate-limited
-API calls) and goes straight to alphas and training.
-
-To change what runs, edit `config/settings.py`:
-
-```python
-COMPANIES = {"AAPL": "Apple", "MSFT": "Microsoft"}   # tickers to process
-START_DATE = "2024-06-01"
-END_DATE   = "2025-09-01"
-FORCE_REFETCH = False              # True re-downloads everything
-FORCE_REGENERATE_ALPHAS = True     # False reuses cached alpha formulas
-```
-
-First run on a single ticker takes roughly 10–20 minutes, dominated by news
-pagination (12 s between batches) and peer sentiment (15 s between tickers).
-Cached runs are far faster.
+- The ML image (about 2.3 GB, with CPU-only PyTorch) is built from this repo
+  with `ml_service/Dockerfile`. It reads keys from `ml_service/.env`.
+- `models/` is bind-mounted, so the container serves the same trained models
+  as a native run. The job queue database lives in the `mlstate` volume.
+- The ML port is published on `127.0.0.1` only. The backend reaches the
+  service at `http://ml-service:8000`.
+- Don't run the native ML service and the container at the same time: both
+  bind port 8000.
 
 ---
 
-## Architecture
+## Using the app
 
-`ImprovedDualStreamLSTM` (`src/models/architectures/dual_stream_lstm.py`)
-processes alphas and prices as two parallel streams and fuses them.
-
-```
-alphas [B, 30, num_alphas]              prices+temporal [B, 30, 4]
-   │                                        │
-   ├── ResidualLSTM (bi, 3 layers) ─┐       ├── ResidualLSTM (bi, 3 layers) ─┐
-   │      └─ MultiHeadAttention     │       │      └─ MultiHeadAttention     │
-   │         + residual, mean-pool  │       │         + residual, mean-pool  │
-   │                          [B,2H]│       │                          [B,2H]│
-   └── TCN (d=1, d=2) + AvgPool ──► [B,H]   └── TCN (d=1, d=2) + AvgPool ──► [B,H]
-                                    │                                        │
-             cross-attention (alpha queries ◄── price keys/values) ──► [B,2H]
-                                    │
-                     concat ──► [B, 8H]  (H = hidden_size)
-                                    │
-        Linear 8H→1024→512→256→128→64, each + LayerNorm + ReLU + Dropout
-                                    │
-                        MC dropout ──► fc_mean ──► predicted return
-```
-
-Components:
-
-- **`ResidualLSTM`** — bidirectional LSTM with a residual connection; the
-  projection collapses to `Identity` when input and output widths match.
-- **`MultiHeadAttention`** — hand-written scaled dot-product attention over the
-  time axis, added residually before global average pooling.
-- **`TCNBlock`** — dilated 1-D convolutions (dilation 1 then 2) capturing local
-  patterns in parallel with the LSTM.
-- **Cross-attention** — `nn.MultiheadAttention` letting the alpha stream attend
-  to the price stream.
-- **`ModelEnsemble`** — wraps N trained models and combines them with
-  **learnable softmax weights**, averaging predictions and uncertainties.
+1. Open a symbol and pick the **1D** interval. Predictions are daily, so the
+   option is hidden on other intervals.
+2. Open **ƒ Indicators → Model → Model prediction**. The chart then shows:
+   - **Backtest:** a dotted orange line of the model's one-step-ahead
+     predicted closes over its test period, inside a shaded ±2σ band, against
+     the real candles.
+   - **Forecast:** a dashed segment from the last close to the predicted next
+     close, with a widening cone and a **Model** price label on the axis.
+   - **Legend:** direction and size of the move, the as-of date, and backtest
+     accuracy next to the always-majority baseline.
+3. The panel under the chart shows the full details and the controls:
+   - **Refresh prediction (~1 min):** reuses the saved model and fetches only
+     new news days and fresh prices.
+   - **Retrain / Train model (~20 min):** runs the full pipeline and asks
+     for confirmation first.
+   - Both estimates include any runs already queued.
+   - While a run is going you see the stage, queue position, percent and ETA.
+     You can leave the page: the last ticker and the overlay setting are
+     remembered, and progress picks up again when you return.
+4. Only one run executes at a time across all users. If someone already
+   queued the same run, your request joins it. Each user can have one run of
+   their own in progress.
 
 ---
 
-## Technical decisions
+## Pre-trained models
 
-### Two streams instead of one wide input
+Trained with `scripts/train_batch.py` on a rolling 2-year window ending
+2026-10-13, using Groq alphas. Accuracy is next-day direction on the
+held-out final 15% of days. The **baseline** is always guessing that period's
+more common direction.
 
-Alphas and raw price/temporal data have very different scales and dynamics.
-Separate LSTMs let each stream learn its own representation before fusion, and
-cross-attention explicitly models the interaction rather than hoping a single
-concatenated input discovers it.
+| Ticker | Test accuracy | Baseline | Peers found from news |
+| --- | --- | --- | --- |
+| AAPL | 36.2% | 56.5% | MSFT, AMZN, GOOG, INTC, META |
+| AMZN | 55.1% | 60.9% | MSFT, GOOG, META, AAPL, NVDA |
+| JPM | 42.0% | 56.5% | NDAQ, AXP, SOFI, AAPL, MSFT |
+| PEP | 54.7% | 56.2% | CCEP, PG, NDAQ, AMZN, TGT |
+| TM | 42.9% | 50.8% | TSLA, BYD, DAL, GM, BA |
+| MSFT | 46.4% | 59.4% | AMZN, AAPL, META, GOOG, NVDA |
+| BTCUSDT | 53.4% | 52.4% | none (IBIT news only) |
 
-### LLM-authored alpha formulas
+Several models lean heavily toward predicting DOWN. AAPL, for example,
+called only 10% of up days correctly. JPM and PEP were trained before
+exchange operators were excluded from peers, so they include NDAQ; a retrain
+fixes that.
 
-Rather than hand-coding signals, `alpha_generator.py` sends a feature sample to
-Groq and asks for formulas; `alpha_computer.py` parses and evaluates them into
-columns.
+Retrain the set (about 25 min per ticker on CPU with free-tier Polygon):
 
-- Only the **first 80%** of rows is sampled for the prompt, so the LLM never
-  sees test-period data.
-- `EnhancedAlphaComputer` validates that every referenced column exists,
-  normalizes unicode operators (`× ÷ − –`) and `^`→`**`, and evaluates with
-  `eval(formula, {"__builtins__": {}}, namespace)`.
-- Results are clipped to **mean ± 3σ** to stop a single outlier from dominating
-  the scaler.
-- `generate_simple_alphas()` provides a static fallback, and
-  `add_fallback_alphas()` fills in momentum/RSI/MACD signals if every formula
-  fails, so training never blocks on the LLM.
-
-> Note: the evaluator uses `eval` with builtins stripped. That blocks casual
-> mistakes but is **not** a security boundary — only point it at a trusted LLM
-> endpoint, never at user-supplied formula text.
-
-### Target construction avoids look-ahead
-
-`create_target_safely()` in `feature_engineering.py`:
-
-```python
-df['target'] = df['close'].pct_change(1).shift(-1)   # tomorrow's return
-df = df[:-1]                                         # last row has no target
+```powershell
+.\.venv-win\Scripts\python.exe scripts\train_batch.py --log batch.log                 # AAPL AMZN JPM PEP TM
+.\.venv-win\Scripts\python.exe scripts\train_batch.py --tickers MSFT BTCUSDT --log batch.log
 ```
 
-The `shift(-1)` makes the label strictly future relative to the row's features,
-and the trailing NaN row is dropped. The ffill/fillna cleanup in
-`add_advanced_features()` deliberately **excludes** `target` so labels are never
-synthesized.
+The batch uses the service's own job queue, so it is safe to run while the
+service is up. Its measured stage times also become the ETAs the UI shows.
 
-### Hybrid loss targets direction, not just magnitude
+---
+
+## How the model works
+
+### Pipeline (per ticker)
+
+| Stage | What happens |
+| --- | --- |
+| **news** | Polygon articles over the last `LOOKBACK_DAYS` (730). Each title + description is scored with VADER and averaged per day. spaCy pulls out organisation names, which are resolved to tickers via `company_tickers.json`. |
+| **peers** | The most-mentioned companies become candidate peers. Each must pass a yfinance quality check: major exchange, market cap ≥ $5B, volume ≥ 100k. Exchange operators (NDAQ, ICE, SPGI, CME, …) are always excluded. Up to 5 peers are kept and their news is fetched too. Stocks only. |
+| **prices** | Daily OHLCV from yfinance. A still-forming bar is dropped: today's crypto bar always, today's stock bar until 16:15 New York time. A finished session missing from Yahoo's daily series is rebuilt from 1-minute bars at the official close. |
+| **alphas** | Groq (`openai/gpt-oss-120b` by default) writes 5 formulas over the technical and sentiment columns, seeing only rows from the training period. Formulas are validated and evaluated. If Groq fails, built-in technical alphas are used. |
+| **train** | 3-member ensemble of `ImprovedDualStreamLSTM` (below), up to 100 epochs each with early stopping. |
+| **backtest** | One-step-ahead predictions over the test block, each starting from the *actual* previous close, so errors never compound. |
+| **predict** | Forecast for the next trading day (stocks skip weekends; crypto uses the next calendar day). |
+
+A **refresh** runs only news (new days only), prices and predict. It reuses the
+saved alpha formulas, clip bounds, scalers and weights, and leaves the
+backtest unchanged. If a saved alpha can no longer be computed, the refresh
+fails with "run a retrain" instead of silently feeding different inputs.
+
+FRED macro data and SEC filings are **not** used by the service. They remain
+only in the legacy research pipeline.
+
+### Crypto
+
+Polygon does not tag news with its `X:` crypto tickers (checked: zero articles
+for `X:BTCUSD`), and the bare symbols collide with stocks (`ETH` is Ethan
+Allen). So:
+
+- BTC uses spot-ETF news (**IBIT**) and ETH uses **ETHA**.
+- The other 13 seeded pairs have no news source and train on price and
+  technical features only. The UI says so.
+- Crypto never gets peers.
+- yfinance renamed two assets: UNI is `UNI7083-USD`, and MATIC is
+  `POL28321-USD`.
+
+### Data preparation (`src/models/training/data_prep.py`)
+
+- `target[t] = close[t+1] / close[t] − 1`. The last row keeps a NaN target:
+  it is the window that produces the forecast.
+- Leading indicator warm-up rows are trimmed (at most 60). Gaps are
+  forward-filled, never back-filled, so no future value leaks backwards.
+- **Contiguous, date-ordered split** of labelled rows: 70% train, 15%
+  validation, 15% test. Validation and test windows may look back into
+  earlier rows for input, but labels never cross blocks.
+- Alpha outlier clipping (±3σ) and all scalers are fitted on training rows
+  only. The target scaler only divides by its std (`with_mean=False`), so a
+  scaled return keeps its sign. The direction loss and up/down metrics depend
+  on that.
+- A window ending on row *r* is labelled with `target[r]`, the return
+  straight after the last day it sees. The price stream is `close` plus
+  day-of-week, day-of-month and month features.
+
+### Architecture (`src/models/architectures`)
 
 ```
-loss = α·MSE + β·direction_loss + γ·large_move_MAE
+alphas [B, 30, k]                         close + temporal [B, 30, 4]
+   ├─ ResidualLSTM (bi, 3 layers) + attention ─┐   ├─ ResidualLSTM (bi, 3 layers) + attention ─┐
+   └─ TCN (dilation 1, 2) + pooling ───────────┤   └─ TCN (dilation 1, 2) + pooling ───────────┤
+                cross-attention (alpha queries over price keys/values)
+                            concat → MLP 1024→512→256→128→64 → next-day return
 ```
 
-MSE alone optimizes magnitude, but trading outcomes depend on sign. The
-direction term penalizes sign mismatches, and the third term adds MAE on moves
-above 2% so quiet days don't dominate.
+- **Training:** `HybridLoss` = MSE + class-weighted direction loss + MAE on
+  moves above 2%. The minority direction is up-weighted, because otherwise
+  the model learns to always predict the majority.
+- **Checkpoints:** the kept weights must predict both directions with some
+  skill: either validation loss improves with min(up, down) precision ≥ 20%,
+  or that balance reaches a new best ≥ 25%. If neither ever happens, the
+  lowest-loss epoch is used. Checkpoints are kept in memory, not written to
+  shared files.
+- **Ensemble:** 3 members with varied dropout (0.30, 0.35, 0.40) and
+  learning rates.
+- **Uncertainty:** MC dropout (10 samples per member). The ensemble σ
+  combines each member's spread and the disagreement between members:
+  `var = Σ wᵢ(σᵢ² + μᵢ²) − μ²`. Both μ and σ are converted back to return
+  units. Sampling is seeded, so a reload gives the same prediction.
+  The ±2σ bands describe model uncertainty; they are **not** calibrated
+  confidence intervals.
 
-`create_balanced_hybrid_loss()` inspects the training label distribution and
-applies **inverse-square-root frequency weights** plus a 1.5× boost to the
-minority class, then shifts weights to `α=0.6, β=0.35, γ=0.05` to emphasize
-direction. This exists because equity returns in a bull sample skew upward, and
-an unweighted model learns to predict "up" unconditionally.
+---
 
-### Checkpointing on a balanced metric, not just loss
+## Prediction service (`ml_service`)
 
-`train_with_fixes()` saves a checkpoint when **either**:
+### Model bundles
 
-1. validation loss improves *and* `min(up_precision, down_precision) ≥ 20%`, or
-2. that balanced metric reaches a new best *and* is `≥ 25%`.
+`models/{TICKER}/` holds:
 
-Pure best-val-loss checkpointing tends to select degenerate models that always
-predict one direction. Requiring both classes to be predicted with some skill
-filters those out.
+| File | Contents |
+| --- | --- |
+| `model_{i}.pth` | Ensemble member weights |
+| `scalers.json` | Scaler parameters |
+| `meta.json` | Exact alpha recipes, clip bounds, hyperparameters, data range, split dates, peers, metrics |
+| `backtest.json` | Test-period predictions |
+| `prediction.json` | Latest forecast |
 
-### Monte-Carlo dropout for uncertainty
+- **Safe to load:** scalers are JSON rather than pickle, and weights load
+  with `weights_only=True`, so loading a bundle never runs arbitrary code.
+- **Atomic writes:** a bundle is written to a temp folder and swapped in. A
+  failed save leaves the previous bundle intact.
+- **Caches survive retrains:** news and mention caches live in
+  `models/_cache/{NEWS_TICKER}/` and are shared, so training AAPL reuses news
+  already fetched for MSFT's peers.
 
-At inference the model keeps dropout **active** and runs `n_samples` forward
-passes, reporting the mean as the prediction and the standard deviation as
-uncertainty (plus `1e-6` so it is never exactly zero). This gives calibration
-information — `metrics.py` reports the correlation between uncertainty and
-absolute error — and feeds the `pred ± 2σ` confidence interval in
-`make_live_prediction()`.
+### Job queue (`jobs.py`)
 
-### Feature selection before training
+- **Storage:** jobs live in SQLite (`models/jobs.db`), so the queue survives
+  restarts.
+- **One at a time:** a single worker thread runs the oldest queued job first,
+  even across processes (the service and `train_batch.py`).
+- **Joining:** a second request for the same (ticker, kind) returns the
+  existing job. A database index enforces this too.
+- **One per user:** a user may own one queued or running job. Joining
+  someone else's job doesn't count against that.
+- **Failure detection:** running jobs record their owner process and send a
+  heartbeat. A job is only marked "interrupted" when its heartbeat is stale
+  *and* its process is gone, or after 6 h of silence. A laptop waking from
+  sleep therefore keeps its job.
+- **Keeping the machine awake:** while a job runs, the worker asks Windows
+  not to sleep.
+- **ETAs:** stage durations are learned from the last 10 completed runs.
+  Until then the defaults are train ≈ 24 min and refresh ≈ 70 s, measured
+  on CPU with free-tier Polygon.
+- **Errors:** messages meant for users are passed through. Unexpected errors
+  show a generic message, with details only in the service log.
 
-With sentiment, macro, and alternative data the raw frame reaches hundreds of
-columns — far too many for a few hundred training rows.
-`select_top_features()` scores candidates by absolute Pearson correlation,
-mutual information, or a `0.6·corr + 0.4·MI` blend, then keeps the top `k`.
-Alpha, temporal, and OHLCV columns are always force-included regardless of score
-because the architecture requires them.
+### Command line
 
-### Excel as the cache layer
+```powershell
+python -m ml_service.cli train MSFT            # full pipeline, prints progress, writes the bundle
+python -m ml_service.cli refresh MSFT          # new prediction with the saved model
+python -m ml_service.cli train BTCUSDT --epochs 20 --members 2 --quiet
+```
 
-`excel_handler.py` writes one workbook (`stock_analysis_complete.xlsx`) with
-sheets *Daily Sentiment, Stock Prices, Related Companies, Alpha Formulas, Model
-Results, Metadata*. It is slower than Parquet, but it is inspectable by hand and
-makes the rate-limited API results easy to audit. `cache_manager.py` validates
-the sheets exist and cover the requested tickers before the pipeline offers to
-reuse them.
+The CLI runs the pipeline directly. Use `scripts/train_batch.py` instead when
+the service is running, so the queue and ETAs stay accurate.
 
-### Data augmentation on training windows
+---
 
-`EnhancedStockDataset` augments **one third** of training samples with one of
-cumulative (Brownian-like) noise, uniform rescaling, or cubic-spline time
-warping. Validation and test sets are never augmented. With only a few hundred
-windows this is meaningful regularization for a multi-million-parameter model.
+## Trading platform
+
+The TradingView clone in `Trading_Platform`, originally built by
+[Shubham Gupta](https://github.com/shubhamgupta0258) and
+[Prince Kumar](https://github.com/princekumar284).
+
+**Features**
+- Register, log in and log out. JWT access tokens (1 h) plus a refresh token
+  (7 days) stored in Redis and sent as an HTTP-only cookie.
+- Interactive candlestick charts (lightweight-charts) with rounded candles,
+  volume, SMA/EMA and Bollinger Bands overlays.
+- Drawing tools: trend line, ray, extended line, horizontal and vertical
+  lines, rectangle, Fibonacci.
+- Live prices over STOMP/SockJS from Binance and Finnhub streams.
+- Symbol search, watchlist, paper trading with portfolio and P&L, price
+  alerts, market news.
+- **Model predictions:** the overlay, panel and jobs described above.
+
+**Tech stack**
+
+| Layer | Technology |
+| --- | --- |
+| Backend | Go 1.26, Gin, golang-jwt, bcrypt, pgx, go-redis, shopspring/decimal, gorilla/websocket, sockjs-go |
+| Data | PostgreSQL 15 with Flyway migrations, Redis 7 |
+| Frontend | React 19, Vite 8, React Router 7, Axios, lightweight-charts 5, @stomp/stompjs |
+| Market data | Finnhub (stock prices, symbols, news), Alpha Vantage (daily candles), Binance (crypto) |
+
+Seeded symbols:
+- **Stocks:** AAPL, GOOGL, TSLA, MSFT, AMZN, JPM, PEP, TM.
+- **Crypto:** 15 Binance USDT pairs (BTC, ETH, BNB, SOL, XRP, ADA, DOGE,
+  MATIC, DOT, LINK, AVAX, UNI, LTC, ATOM, XLM).
+
+Stocks show daily candles only. Crypto offers 1H, 4H, 1D and 1W.
+
+---
+
+## API reference
+
+### Platform API (`http://localhost:8080/api`)
+
+Every route except `/api/auth/**` needs `Authorization: Bearer <accessToken>`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout` | Account and session |
+| GET | `/user/me` | Current user |
+| GET | `/symbols`, `/symbols/search?q=`, `/symbols/{ticker}` | Symbols |
+| GET | `/candles/{ticker}?interval=1D` | OHLCV (`1H`, `4H`, `1D`, `1W`) |
+| GET | `/news/{ticker}` | Latest news |
+| GET, POST, DELETE | `/watchlist`, `/watchlist/{ticker}` | Watchlist |
+| GET | `/portfolio` | Holdings and P&L |
+| POST, GET | `/trades/buy`, `/trades/sell`, `/trades/history` | Paper trading |
+| GET, POST, DELETE | `/alerts`, `/alerts/{id}/cancel`, `/alerts/{id}` | Price alerts |
+| GET | `/predictions/{ticker}` | Stored prediction, backtest, active job, ETA estimates |
+| POST | `/predictions/{ticker}/jobs` | Body `{"kind": "train" \| "refresh"}`. **202** created, **200** joined an identical job, **409** you already have another job (body includes it), **400** invalid or refresh without a model, **404** unknown symbol, **503** ML service down or not configured |
+| GET | `/prediction-jobs/{id}` | Job status: `queued`/`running`/`succeeded`/`failed`, stage, progress %, queue position, ETA |
+
+WebSocket (`/ws`, STOMP over SockJS): `/topic/price/{SYMBOL}`,
+`/topic/candle/{SYMBOL}/{INTERVAL}`, `/topic/alerts/{userId}`.
+`GET /healthz` is public.
+
+Example `GET /api/predictions/AAPL` (trimmed):
+
+```json
+{
+  "ticker": "AAPL", "assetType": "STOCK", "hasNews": true, "status": "ready",
+  "trainedAt": "2026-10-14T16:41:52+00:00", "peers": ["MSFT", "AMZN", "GOOG", "INTC", "META"],
+  "prediction": { "asOfDate": "2026-10-14", "targetDate": "2026-10-15", "lastClose": 342.96,
+                  "predictedClose": 342.86, "lower": 341.92, "upper": 343.79, "sigma": 0.0014,
+                  "direction": "DOWN" },
+  "backtest": { "start": "2026-07-08", "end": "2026-10-13", "points": ["…69 days…"],
+                "metrics": { "n": 69, "directionalAccuracy": 36.23, "majorityBaseline": 56.52,
+                             "upPrecision": 10.26, "downPrecision": 70.0 } },
+  "activeJob": null,
+  "estimates": { "trainSeconds": 1267, "refreshSeconds": 67, "queueSeconds": 0 }
+}
+```
+
+### ML service API (`http://127.0.0.1:8000`, internal)
+
+Only the Go backend calls this API. Every route except `/health` requires
+`X-Internal-Token`. JSON uses snake_case, and the backend converts it to
+camelCase.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/health` | Liveness |
+| GET | `/models/{ticker}` | Same data as the platform endpoint |
+| POST | `/jobs` | `{"ticker", "kind", "user_id"}` → 202 / 200 / 409 / 400 |
+| GET | `/jobs/{id}` | Job status |
 
 ---
 
 ## Configuration reference
 
-`config/settings.py`. Note that several of these are **not** currently read by
-the trainer — see [Known issues](#known-issues-and-rough-edges).
+### `ml_service/.env`
 
-| Setting | Value | Purpose |
-| ------- | ----- | ------- |
-| `COMPANIES` | `{"AAPL": "Apple"}` | Tickers to process |
-| `START_DATE` / `END_DATE` | `2024-06-01` / `2025-09-01` | Date range |
-| `DATA_FILE` | `stock_analysis_complete.xlsx` | Excel cache path |
-| `FORCE_REFETCH` | `False` | Bypass cache entirely |
-| `FORCE_REGENERATE_ALPHAS` | `True` | Re-ask the LLM for formulas |
-| `WINDOW_SIZE` | 30 | Sequence length in trading days |
-| `NUM_EPOCHS` | 100 | Max epochs |
-| `LEARNING_RATE` | 2e-4 | AdamW base LR *(see note)* |
-| `HIDDEN_SIZE` | 192 | LSTM hidden units *(see note)* |
-| `NUM_LAYERS` | 3 | LSTM depth |
-| `DROPOUT` | 0.35 | Dropout rate *(see note)* |
-| `NUM_HEADS` | 6 | Attention heads *(see note)* |
-| `PATIENCE` | 25 | Early-stopping patience *(see note)* |
-| `GRADIENT_CLIP_NORM` | 1.0 | Gradient-norm clip |
-| `ENSEMBLE_SIZE` | 3 | Models per ensemble |
-| `ENSEMBLE_MC_SAMPLES` | 10 | MC-dropout samples |
-| `TOP_K_FEATURES` | 30 | Features kept by selection |
-| `MIN_CORRELATION` | 0.01 | Selection threshold |
-| `LOSS_ALPHA/BETA/GAMMA` | 0.7 / 0.3 / 0.1 | Hybrid loss weights |
-| `MIN_MARKET_CAP` | 5e9 | Peer filter |
-| `NEWS_SLEEP_TIME` | 12 s | Polygon pagination delay |
-| `RELATED_COMPANIES_SLEEP_TIME` | 15 s | Peer fetch delay |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POLYGON_API_KEY` | – | News (required for training) |
+| `GROQ_API_KEY` | – | LLM alphas. Without it, fallback alphas are used |
+| `ML_INTERNAL_TOKEN` | – | Shared secret with the Go backend. The service won't start without it |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model for alphas |
+| `MODEL_DIR` | `models` | Bundles and caches |
+| `JOBS_DB_PATH` | `models/jobs.db` | Job queue database |
+| `LOOKBACK_DAYS` | `730` | Rolling data window |
+| `NEWS_SLEEP_TIME` | `12` | Minimum seconds between Polygon requests (free tier: 5/min) |
+| `NEWS_BATCH_SIZE` | `1000` | Articles per Polygon page |
+| `MAX_RELATED_COMPANIES` | `5` | Peers per stock |
+| `WINDOW_SIZE` | `30` | Look-back window in days |
+| `ENSEMBLE_SIZE` | `3` | Ensemble members |
+| `NUM_EPOCHS` | `100` | Max epochs per member |
+| `MC_SAMPLES` | `10` | MC-dropout samples |
+
+### `Trading_Platform/trading-backend-go/.env`
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `JWT_SECRET` | – (required, ≥ 32 chars) | Token signing |
+| `FINNHUB_API_KEY`, `ALPHA_VANTAGE_API_KEY` | – | Market data |
+| `ML_INTERNAL_TOKEN` | empty | Must match `ml_service/.env`. If empty, prediction routes answer 503 |
+| `ML_SERVICE_URL` | `http://127.0.0.1:8000` | ML service address |
+| `ML_TIMEOUT_MS` | `10000` | Timeout per ML request |
+| `PORT` | `8080` | HTTP port |
+| `DATABASE_URL` | `postgres://dev:dev@localhost:5432/trading?sslmode=disable` | PostgreSQL |
+| `REDIS_ADDR`, `REDIS_PASSWORD` | `localhost:6379`, empty | Redis |
+| `JWT_EXPIRATION_MS`, `JWT_REFRESH_EXPIRATION_MS` | `3600000`, `604800000` | Token lifetimes |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:5173` … `5176` | Allowed browser origins |
+| `SEED_SYMBOLS`, `STREAM_MARKET_DATA` | `true` | Startup seeding and live streams |
+| `POSTGRES_HOST_PORT`, `REDIS_HOST_PORT`, `ML_HOST_PORT` | `5432`, `6379`, `8000` | Host ports published by docker compose |
+| `ML_REPO_DIR` | `../..` | Path from `trading-backend-go` to this repo (docker compose) |
 
 ---
 
-## Outputs
+## Testing
 
-| File | Contents |
-| ---- | -------- |
-| `stock_analysis_complete.xlsx` | The full data cache (6 sheets) |
-| `{TICKER}_ensemble.pth` | Ensemble weights |
-| `{TICKER}_model_{i}.pth` | Individual ensemble member weights |
-| `best_model.pth`, `best_model_checkpoint.pth` | Best-checkpoint weights (overwritten every run) |
-| `{TICKER}_training_progress.png` | Loss / accuracy / LR / precision curves |
-| `{TICKER}_predictions_enhanced.png` | Predictions with uncertainty, error analysis |
-| `{TICKER}_stock_price_prediction.png` | Reconstructed price paths |
+```powershell
+.\.venv-win\Scripts\python.exe -m pytest                     # 163 Python tests
+cd Trading_Platform\trading-backend-go; go test ./...        # Go (74 test cases incl. subtests)
+cd Trading_Platform\trading-frontend; npm test               # 48 frontend tests (vitest)
+.\.venv-win\Scripts\python.exe scripts\smoke_e2e.py          # live end-to-end check
+```
 
-Reported metrics (`src/models/evaluation/metrics.py`): MSE, RMSE, MAE,
-directional accuracy, up/down precision, large-move hit rate,
-uncertainty-error correlation, annualized Sharpe of the signal, win rate, and
-average/max uncertainty.
+- **Python:** data prep and leakage checks, window/target alignment, bundle
+  round-trips, inference and backtest, the pipeline with fake providers, the
+  job queue (FIFO, joining, per-user limit, restarts, sleep tolerance, ETAs),
+  the HTTP API and the batch script.
+- **Go:** the ML client against a fake server (decoding, token, errors,
+  timeouts), the prediction service with fakes, and routing and auth.
+- **Frontend:** overlay maths, the job-state logic, the polling hook (fake
+  timers) and the panel (React Testing Library on happy-dom).
+- Repository integration tests in Go run only with
+  `$env:TEST_DATABASE_URL = "postgres://dev:dev@127.0.0.1:5432/trading?sslmode=disable"`.
+- `npm run lint` reports 16 problems that predate the prediction work.
+
+---
+
+## Security
+
+- **Secrets:** `.env` files (both repos) and `config/secret_key.py` are
+  git-ignored. If a key has ever been pasted somewhere public, rotate it.
+- **ML service access:** it binds to `127.0.0.1` (Docker publishes it on
+  loopback only) and trusts any caller with `ML_INTERNAL_TOKEN`, compared in
+  constant time. Never expose port 8000. End users authenticate only against
+  the Go backend, which passes their user id along.
+- **Input checks:** tickers are validated before they reach file paths or
+  provider calls. Job ids are random 128-bit values, and malformed ids are
+  rejected before any lookup.
+- **No unsafe loading:** bundles contain no pickles, and weights load with
+  `weights_only=True`.
+- **Alpha formulas:** they are evaluated with Python `eval` with builtins
+  removed, and only ever come from the configured LLM. That stops casual
+  mistakes but is not a sandbox, so never feed user-supplied formula text
+  into it.
+- **Before any deployment:** this setup targets local use. The refresh cookie
+  is sent with `Secure=false` for plain HTTP, CORS allows only localhost
+  origins, and there's no rate limiting beyond the job queue's rules. All of
+  that would need changing, along with TLS.
 
 ---
 
 ## Interpreting results
 
-| Metric | Reading |
-| ------ | ------- |
-| RMSE / MAE | Error in return units (0.02 ≈ 2 percentage points) |
-| Directional accuracy | % of days the predicted sign was right; **50% is the baseline** |
-| Up / Down precision | Per-class accuracy — the honest check for a one-sided model |
-| Sharpe ratio | Annualized (×√252) Sharpe of the signal's returns |
-| Uncertainty correlation | Positive means the model knows when it is unsure |
+| Metric | Meaning |
+| --- | --- |
+| Direction accuracy | Share of test days where the predicted sign was right |
+| Always-majority baseline | Accuracy of always guessing that period's more common direction. Beat this, not 50% |
+| Up days called up / Down days called down | Per-class hit rates. A one-sided model scores high on one and near zero on the other |
+| σ / ±2σ band | Model uncertainty from MC dropout and ensemble disagreement, in return units. Not a calibrated interval |
 
-Set expectations accordingly:
-
-- Directional accuracy near 50% is the *expected* result. Values in the 45–55%
-  band on a few hundred test rows are statistically indistinguishable from
-  chance.
-- With `START_DATE` at 2024-06-01 the usable sample is only a few hundred rows
-  against a multi-million-parameter model, so metrics move a lot between seeds.
-- Always read **up precision and down precision together**. 55% overall
-  accuracy with 0% down precision is a model that only ever predicts "up."
-- A high Sharpe on a short test window is far more likely to be noise than edge.
+With about 65–100 test days, differences of a few points are noise, and
+results move noticeably between retrains.
 
 ---
 
-## Known issues and rough edges
+## Known limitations
 
-Documented honestly so nobody is surprised.
-
-**The train/val/test split shuffles.** `prepare_data_with_fixes()` uses
-`train_test_split(..., stratify=..., random_state=42)`, which randomizes row
-order before splitting. For time-series data this leaks future information into
-training and makes reported metrics optimistic. A contiguous split by date would
-be more defensible; the windowing in `EnhancedStockDataset` also assumes rows
-are contiguous, which shuffled splits violate.
-
-**Several `settings.py` values are ignored.** `trainer.py` hardcodes
-`hidden_size=128, num_layers=3, dropout=0.3, num_heads=4`,
-`learning_rate=3e-4`, and `patience=30`, so `HIDDEN_SIZE` (192), `DROPOUT`
-(0.35), `NUM_HEADS` (6), `LEARNING_RATE` (2e-4), and `PATIENCE` (25) have no
-effect. Change the constructor calls in
-`src/models/training/trainer.py` to actually apply them.
-
-**`settings.py` currently holds fast-mode values.** Its docstring still reads
-"FAST TRAINING MODE - For quick testing" and it is byte-identical in size to
-`settings_fast.py`. The date range is ~15 months, not the 2 years the original
-full config used.
-
-**Empty stubs.** `scripts/download_data.py`, `scripts/train_models.py`, and
-`scripts/make_predictions.py` are 0 bytes. `run_pipeline.py` is the only working
-entry point.
-
-**No tests.** Every file in `tests/` is 0 bytes and no test runner is
-configured. Nothing is verified automatically.
-
-**`requirements.txt` is not installable** as-is (wrapped in `"""`). Same stray
-quotes appear in `.gitignore`, though there they are merely an inert pattern —
-ignoring itself works correctly (verified: `*.pth`, `build/`, and
-`config/secret_key.py` are all matched).
-
-**SEC collector limitations.** `fetch_sec_filings()` derives the filing date
-from `root.split('/')[-1]`, which breaks on Windows backslash paths, and its
-`start_date`/`end_date` arguments are accepted but never used for filtering.
-"Earnings transcripts" are not transcripts — they are earnings-surprise
-percentages from `yfinance` used as a sentiment proxy.
-
-**Hardcoded ticker logic.** `add_advanced_features()` contains AMZN- and
-AAPL/GOOG-specific interaction features, so behavior is not uniform across
-tickers.
-
-**Shared checkpoint filenames.** Every model writes to `best_model.pth` and
-`best_model_checkpoint.pth`, so concurrent or successive runs overwrite each
-other's checkpoints.
+- **Daily only:** next-day forecasts on the 1D chart, no multi-day horizon.
+  Stock target dates skip weekends but not exchange holidays.
+- **Short chart history:** the chart loads about 100 daily candles (Alpha
+  Vantage `compact`, Binance `limit=100`), so it shows only the recent part
+  of a backtest.
+- **Thin crypto news:** news exists only for BTC and ETH, via ETF proxies.
+- **ETAs:** learned per job kind, not per asset. Crypto pairs without news
+  finish the news and peers stages almost instantly, which pulls stock ETAs
+  down a little.
+- **Fixed hyperparameters:** the ensemble uses hidden size 128, 3 layers and
+  4 heads. `HIDDEN_SIZE`, `DROPOUT`, `NUM_HEADS`, `LEARNING_RATE` and
+  `PATIENCE` in `config/settings.py` have no effect. The service is
+  configured through `ml_service/.env`.
+- **One worker:** jobs run one at a time on one machine, by design. A
+  ~20-minute retrain blocks other runs for that long.
 
 ---
 
 ## Troubleshooting
 
+**Postgres container fails with "ports are not available … forbidden by its access permissions"**
+: Windows reserves some port ranges (check with
+`netsh interface ipv4 show excludedportrange protocol=tcp`). On this machine
+55041–55644 is reserved, so 55432 fails. Pick a free port, e.g.
+`POSTGRES_HOST_PORT=15432` plus
+`DATABASE_URL=postgres://dev:dev@127.0.0.1:15432/trading?sslmode=disable`.
+
+**`password authentication failed for user "dev"`**
+: A native PostgreSQL is also listening on 5432. Move the container to
+another port (above) or stop the native service. The same applies to Redis
+via `REDIS_HOST_PORT` / `REDIS_ADDR`.
+
+**Predictions show "Prediction service unavailable" (503)**
+: Check that the ML service is running (`GET http://127.0.0.1:8000/health`),
+that `ML_INTERNAL_TOKEN` matches in both `.env` files, and that you restarted
+the backend after changing its `.env`.
+
+**"No trained model for X yet" / refresh button disabled**
+: Train it with **Train model** in the panel or `scripts/train_batch.py`.
+
+**"Saved model inputs can't be rebuilt … run a retrain"**
+: An alpha formula refers to a column the fresh data no longer has, for
+example a peer without news. Retrain the ticker.
+
+**Alpha source shows `fallback`**
+: Groq failed or isn't configured. Groq retires models over time
+(`llama-3.3-70b-versatile` returned 404 in Oct 2026). List what your key can
+use and set `GROQ_MODEL`.
+
+**Jobs marked "Interrupted by a service restart"**
+: The process running the job died, or stayed silent for more than 6 h.
+Start the job again.
+
+**Polygon 429s or slow news**
+: Raise `NEWS_SLEEP_TIME`. The first training run for a heavily covered
+ticker with 5 peers takes longest; later runs reuse the cache.
+
+**`UnicodeEncodeError: 'charmap' codec` in a console**
+: Legacy code prints Greek letters and emoji. The service and scripts switch
+stdout to UTF-8; for your own scripts, call
+`ml_service.console.ensure_utf8_stdio()`.
+
 **`ModuleNotFoundError: en_core_web_sm`**
-Run `python -m spacy download en_core_web_sm`.
+: `python -m spacy download en_core_web_sm`.
 
-**`pip install -r requirements.txt` fails immediately**
-Remove the `"""` lines from `requirements.txt` (see [Install](#install)).
+---
 
-**`ModuleNotFoundError: config.secret_key`**
-Create `config/secret_key.py` with the three keys. It is git-ignored, so it never
-arrives with a fresh clone.
+## Legacy research pipeline
 
-**Polygon 429 / very slow news collection**
-Free-tier rate limits. Raise `NEWS_SLEEP_TIME` and
-`RELATED_COMPANIES_SLEEP_TIME`, or narrow the date range.
+`scripts/run_pipeline.py` is the original interactive research script.
 
-**`Insufficient data for {ticker}: only N rows`**
-The pipeline needs 100+ rows after feature engineering, and
-`prepare_data_with_fixes` needs `WINDOW_SIZE + 50`. Widen `START_DATE`/
-`END_DATE`.
+- **Data:** it collects news, peers, FRED macro series and SEC MD&A
+  sentiment for the tickers in `config/settings.py`, caches everything in
+  `stock_analysis_complete.xlsx`, and saves PNG plots.
+- **Window and split:** it now uses the same rolling `LOOKBACK_DAYS` window
+  and contiguous split as the service.
+- **Setup:** it needs `config/secret_key.py` with `API_KEY` (Polygon),
+  `GROQ_API_KEY` and `FRED_API_KEY`, plus the commented-out `fredapi` and
+  `sec-edgar-downloader` packages from `requirements.txt`.
+- **Not used by the service:** its FRED/SEC collectors are unmaintained, and
+  `fetch_sec_filings` mis-parses filing dates on Windows paths.
 
-**Test set is empty / "No predictions made"**
-The split left fewer rows than `WINDOW_SIZE`. Use a longer date range or reduce
-`WINDOW_SIZE`.
+---
 
-**Training predicts one direction only**
-Expected failure mode with imbalanced labels. Check the up/down precision in the
-logs, and note that `create_balanced_hybrid_loss()` already applies class
-weighting — a longer, more balanced sample is the real fix.
+## Credits and license
 
-**FRED features all missing**
-`fetch_fred_data` returns an empty frame when `fredapi` is missing or
-`FRED_API_KEY` is unavailable, and it fails silently per series. Check the
-`success_count/total` line it prints.
-
+The trading platform was built by Shubham Gupta and Prince Kumar and is
+MIT-licensed. The ML model, the prediction service and the integration live
+in this repository.
