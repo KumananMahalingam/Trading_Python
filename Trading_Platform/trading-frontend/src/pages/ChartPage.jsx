@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { createChart, CrosshairMode, HistogramSeries, LineSeries } from 'lightweight-charts';
+import {
+    Bell, BellRing, Check, Layers, Minus, MousePointer2, MoveHorizontal, MoveUpRight, Newspaper,
+    Percent, Plus, SeparatorVertical, Slash, Square, Star, Trash2, X,
+} from 'lucide-react';
 import { createPrimitive } from '../utils/drawingTools';
 import { CrosshairHighlightPrimitive } from '../utils/crosshairHighlight';
 import { calcSMA, calcEMA, calcBollingerBands } from '../utils/indicators';
@@ -10,7 +13,6 @@ import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client';
 import { useAuth } from '../context/AuthContext';
 import { getCandles } from '../api/candleApi';
-import { getAllSymbols } from '../api/symbolApi';
 import { getWatchlist, addToWatchlist, removeFromWatchlist } from '../api/watchlistApi';
 import { getAlerts, createAlert, cancelAlert, deleteAlert } from '../api/alertApi';
 import { getMyProfile } from '../api/userApi';
@@ -19,13 +21,33 @@ import { getPortfolio } from '../api/portfolioApi';
 import { getPrediction } from '../api/predictionApi';
 import { buildPredictionOverlay, describePrediction, formatPct } from '../utils/predictionOverlay';
 import { PredictionOverlayRenderer, PREDICTION_COLOR } from '../utils/predictionOverlayRenderer';
+import { DEFAULT_TICKER, LAST_TICKER_KEY, SHOW_PREDICTION_KEY, readPreference, rememberTicker, writePreference } from '../utils/preferences';
+import { useSymbols } from '../hooks/useSymbols';
+import AppShell from '../components/AppShell';
+import ChangePill from '../components/ChangePill';
+import Modal from '../components/Modal';
 import NewsFeed from '../components/NewsFeed';
 import PredictionPanel from '../components/PredictionPanel';
+import TickerAvatar from '../components/TickerAvatar';
 
 // Model predictions are daily, so the overlay is only offered on this interval.
 const PREDICTION_INTERVAL = '1D';
-const SHOW_PREDICTION_KEY = 'showModelPrediction';
-const LAST_TICKER_KEY = 'lastChartTicker';
+
+// Chart palette, matching styles/theme.css
+const CHART = {
+    bg: '#111113',
+    text: '#a1a1aa',
+    grid: '#18181b',
+    border: '#2c2c31',
+    crosshair: '#52525b',
+    label: '#27272a',
+    up: '#22c55e',
+    down: '#ef4444',
+    upVolume: 'rgba(34, 197, 94, 0.28)',
+    downVolume: 'rgba(239, 68, 68, 0.28)',
+    priceLine: '#a1a1aa',
+    font: "'Geist Mono Variable', ui-monospace, Menlo, Consolas, monospace",
+};
 
 function predictionErrorMessage(err) {
     const status = err?.response?.status;
@@ -41,22 +63,24 @@ const CRYPTO_SYMBOLS = [
 ];
 
 const DRAWING_TOOLS = [
-    { id: 'select',    icon: '↖',   label: 'Select',       group: 0, clicks: 0 },
-    { id: 'trendline', icon: '/',    label: 'Trend Line',   group: 1, clicks: 2 },
-    { id: 'ray',       icon: '→',   label: 'Ray',          group: 1, clicks: 2 },
-    { id: 'extline',   icon: '↔',   label: 'Ext. Line',    group: 1, clicks: 2 },
-    { id: 'hline',     icon: '─',   label: 'H. Line',      group: 2, clicks: 1 },
-    { id: 'vline',     icon: '│',   label: 'V. Line',      group: 2, clicks: 1 },
-    { id: 'rectangle', icon: '□',   label: 'Rectangle',    group: 3, clicks: 2 },
-    { id: 'fibonacci', icon: 'Fib', label: 'Fibonacci',    group: 3, clicks: 2 },
+    { id: 'select',    Icon: MousePointer2,     label: 'Select',     group: 0, clicks: 0 },
+    { id: 'trendline', Icon: Slash,             label: 'Trend Line', group: 1, clicks: 2 },
+    { id: 'ray',       Icon: MoveUpRight,       label: 'Ray',        group: 1, clicks: 2 },
+    { id: 'extline',   Icon: MoveHorizontal,    label: 'Ext. Line',  group: 1, clicks: 2 },
+    { id: 'hline',     Icon: Minus,             label: 'H. Line',    group: 2, clicks: 1 },
+    { id: 'vline',     Icon: SeparatorVertical, label: 'V. Line',    group: 2, clicks: 1 },
+    { id: 'rectangle', Icon: Square,            label: 'Rectangle',  group: 3, clicks: 2 },
+    { id: 'fibonacci', Icon: Percent,           label: 'Fibonacci',  group: 3, clicks: 2 },
 ];
 
-const DRAW_COLORS = ['#f5c518', '#2962ff', '#26a69a', '#ef5350', '#d1d4dc'];
+const DRAW_COLORS = ['#f5c518', '#3b82f6', '#22c55e', '#ef4444', '#ededef'];
+
+const fmtMoney = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const DRAW_WIDTHS = [1, 1.5, 2.5];
 
 export default function ChartPage() {
-    const { accessToken, logout } = useAuth();
-    const navigate = useNavigate();
+    const { accessToken } = useAuth();
+    const symbols = useSymbols();
 
     const chartContainerRef = useRef(null);
     const chartRef = useRef(null);
@@ -85,12 +109,10 @@ export default function ChartPage() {
     // Model prediction overlay
     const predictionRendererRef = useRef(null);
     // Remembered across reloads so a running job's progress is visible again.
-    const [showPrediction, setShowPredictionState] = useState(() => {
-        try { return localStorage.getItem(SHOW_PREDICTION_KEY) === '1'; } catch { return false; }
-    });
+    const [showPrediction, setShowPredictionState] = useState(() => readPreference(SHOW_PREDICTION_KEY, '0') === '1');
     const setShowPrediction = (next) => {
         setShowPredictionState(next);
-        try { localStorage.setItem(SHOW_PREDICTION_KEY, next ? '1' : '0'); } catch { /* storage unavailable */ }
+        writePreference(SHOW_PREDICTION_KEY, next ? '1' : '0');
     };
     const [predictionModel, setPredictionModel] = useState(null);   // last API response
     const [predictionError, setPredictionError] = useState(null);   // { ticker, message }
@@ -111,20 +133,13 @@ export default function ChartPage() {
     // Chart state
     // The last viewed symbol is restored on reload (so a running model job is
     // visible again); BTCUSDT on first visit.
-    const [ticker, setTicker] = useState(() => {
-        try { return localStorage.getItem(LAST_TICKER_KEY) || 'BTCUSDT'; } catch { return 'BTCUSDT'; }
-    });
-    const [searchInput, setSearchInput] = useState(ticker);
-    useEffect(() => {
-        try { localStorage.setItem(LAST_TICKER_KEY, ticker.toUpperCase()); } catch { /* storage unavailable */ }
-    }, [ticker]);
+    const [ticker, setTicker] = useState(() => readPreference(LAST_TICKER_KEY, '') || DEFAULT_TICKER);
+    useEffect(() => { rememberTicker(ticker); }, [ticker]);
     const [interval, setInterval] = useState('1D');
     const [livePrice, setLivePrice] = useState(null);
     const [priceChange, setPriceChange] = useState(null);
     const [priceChangePercent, setPriceChangePercent] = useState(null);
     const [error, setError] = useState('');
-    const [symbols, setSymbols] = useState([]);
-    const [showDropdown, setShowDropdown] = useState(false);
 
     // Drawing state (mirror of drawingsRef for rendering)
     const [activeTool, setActiveTool] = useState('select');
@@ -227,11 +242,6 @@ export default function ChartPage() {
     };
 
     // ─── Data loading ─────────────────────────────────────────────────────────
-
-    useEffect(() => {
-        if (!accessToken) return;
-        getAllSymbols().then(setSymbols).catch(() => {});
-    }, [accessToken]);
 
     useEffect(() => {
         if (!accessToken) return;
@@ -433,18 +443,31 @@ export default function ChartPage() {
     // ─── Chart setup (runs once) ──────────────────────────────────────────────
 
     useEffect(() => {
+        // autoSize follows the container (ResizeObserver), so the chart reflows
+        // when side panels open or the window resizes.
         const chart = createChart(chartContainerRef.current, {
-            width: chartContainerRef.current.clientWidth,
-            height: 420,
-            layout: { background: { type: 'solid', color: '#1e222d' }, textColor: '#d1d4dc' },
-            grid: { vertLines: { color: '#2a2e39' }, horzLines: { color: '#2a2e39' } },
-            crosshair: { mode: CrosshairMode.MagnetOHLC },
-            rightPriceScale: { borderColor: '#363a45' },
-            timeScale: { borderColor: '#363a45', timeVisible: true },
+            autoSize: true,
+            layout: {
+                background: { type: 'solid', color: CHART.bg },
+                textColor: CHART.text,
+                fontFamily: CHART.font,
+                fontSize: 11,
+            },
+            grid: { vertLines: { color: CHART.grid }, horzLines: { color: CHART.grid } },
+            crosshair: {
+                mode: CrosshairMode.MagnetOHLC,
+                vertLine: { color: CHART.crosshair, labelBackgroundColor: CHART.label },
+                horzLine: { color: CHART.crosshair, labelBackgroundColor: CHART.label },
+            },
+            rightPriceScale: { borderColor: CHART.border },
+            timeScale: { borderColor: CHART.border, timeVisible: true },
         });
 
         // Rounded candles — ported from plugin-examples/rounded-candles-series
-        const series = chart.addCustomSeries(new RoundedCandleSeriesView(), {});
+        const series = chart.addCustomSeries(new RoundedCandleSeriesView(), {
+            upColor: CHART.up, downColor: CHART.down, wickUpColor: CHART.up, wickDownColor: CHART.down,
+            priceLineColor: CHART.crosshair,
+        });
 
         const volumeSeries = chart.addSeries(HistogramSeries, {
             priceFormat: { type: 'volume' }, priceScaleId: 'volume',
@@ -458,7 +481,7 @@ export default function ChartPage() {
         // ── Live price line — dashed, updates on each WebSocket tick ──────────
         priceLineRef.current = series.createPriceLine({
             price: 0,
-            color: '#2962ff',
+            color: CHART.priceLine,
             lineWidth: 1,
             lineStyle: 2, // LineStyle.Dashed
             axisLabelVisible: true,
@@ -488,11 +511,6 @@ export default function ChartPage() {
             });
             setTooltipPos({ x: param.point.x, y: param.point.y });
         });
-
-        const handleResize = () => {
-            if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth });
-        };
-        window.addEventListener('resize', handleResize);
 
         // Inner helpers scoped to this effect (series is in scope here)
         const addDrawing = (type, label, primitive) => {
@@ -721,7 +739,6 @@ export default function ChartPage() {
         window.addEventListener('mouseup', onMouseUp);
 
         return () => {
-            window.removeEventListener('resize', handleResize);
             window.removeEventListener('keydown', handleKeyDown);
             chartEl.removeEventListener('mousedown', onMouseDown, true);
             window.removeEventListener('mousemove', onMouseMove);
@@ -753,7 +770,7 @@ export default function ChartPage() {
                 seriesRef.current.setData(formatted);
                 volumeSeriesRef.current.setData(formatted.map(c => ({
                     time: c.time, value: c.volume,
-                    color: c.close >= c.open ? '#26a69a80' : '#ef535080',
+                    color: c.close >= c.open ? CHART.upVolume : CHART.downVolume,
                 })));
                 chartRef.current.timeScale().fitContent();
                 lastCandleDataRef.current = formatted;
@@ -814,7 +831,7 @@ export default function ChartPage() {
                     if (!seriesRef.current) return;
                     const open = parseFloat(data.open), close = parseFloat(data.close);
                     seriesRef.current.update({ time: data.timestamp, open, high: parseFloat(data.high), low: parseFloat(data.low), close });
-                    volumeSeriesRef.current.update({ time: data.timestamp, value: parseFloat(data.volume), color: close >= open ? '#26a69a80' : '#ef535080' });
+                    volumeSeriesRef.current.update({ time: data.timestamp, value: parseFloat(data.volume), color: close >= open ? CHART.upVolume : CHART.downVolume });
                 });
             },
             reconnectDelay: 5000,
@@ -826,22 +843,10 @@ export default function ChartPage() {
 
     // ─── Search ───────────────────────────────────────────────────────────────
 
-    const handleSearch = (e) => {
-        e.preventDefault();
-        const symbol = searchInput.trim().toUpperCase();
-        if (symbol) { setTicker(symbol); setShowDropdown(false); }
-    };
-
     const handleSymbolSelect = (symbol) => {
-        setSearchInput(symbol); setTicker(symbol); setInterval('1D'); setShowDropdown(false);
+        setTicker(symbol);
+        setInterval('1D');
     };
-
-    const filteredSymbols = symbols
-        .filter(s =>
-            s.ticker.toUpperCase().includes(searchInput.toUpperCase()) ||
-            s.name.toUpperCase().includes(searchInput.toUpperCase())
-        )
-        .slice(0, 30);
 
     // ─── Trade handlers ───────────────────────────────────────────────────────
 
@@ -869,309 +874,314 @@ export default function ChartPage() {
         }
     };
 
-    const handleLogout = async () => { await logout(); navigate('/login'); };
-    const isPositive = priceChange >= 0;
     const selectedDrawing = drawings.find(d => d.id === selectedId);
+    const symbolInfo = symbols.find(s => s.ticker === upperTicker);
+    const activeAlertCount = alerts.filter(a => a.status === 'ACTIVE').length;
+    const triggeredAlerts = alerts.filter(a => a.status === 'TRIGGERED');
+    const indicatorCount = activeIndicators.size + (predictionEnabled ? 1 : 0);
 
     // ─── Render ───────────────────────────────────────────────────────────────
 
-    return (
-        <div style={styles.page}>
+    const watchlistSection = (
+        <section className="nav-section" aria-labelledby="watchlist-label">
+            <div className="nav-label">
+                <span id="watchlist-label">Watchlist</span>
+                <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={handleAddToWatchlist}
+                    disabled={isInWatchlist}
+                    aria-label={isInWatchlist ? `${upperTicker} is in your watchlist` : `Add ${upperTicker} to watchlist`}
+                    title={isInWatchlist ? 'Already in watchlist' : `Add ${upperTicker}`}
+                >
+                    <Plus size={14} aria-hidden="true" />
+                </button>
+            </div>
+            {watchlist.length === 0 ? (
+                <p className="nav-empty">No symbols yet. Use + to add the current one.</p>
+            ) : (
+                <ul style={{ listStyle: 'none' }}>
+                    {watchlist.map(w => (
+                        <li key={w.ticker} className={`watch-item${w.ticker === upperTicker ? ' active' : ''}`}>
+                            <button
+                                type="button"
+                                className="watch-open"
+                                onClick={() => setTicker(w.ticker)}
+                                aria-current={w.ticker === upperTicker ? 'true' : undefined}
+                            >
+                                <TickerAvatar ticker={w.ticker} />
+                                <span className="mono">{w.ticker}</span>
+                                <span className="price mono">
+                                    {watchlistPrices[w.ticker] ? `$${watchlistPrices[w.ticker].toLocaleString()}` : (w.exchange || '')}
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                className="remove"
+                                onClick={() => handleRemoveFromWatchlist(w.ticker)}
+                                aria-label={`Remove ${w.ticker} from watchlist`}
+                            >
+                                <X size={12} aria-hidden="true" />
+                            </button>
+                        </li>
+                    ))}
+                </ul>
+            )}
+        </section>
+    );
 
-            {/* Alert notification banner */}
+    const topbarActions = (
+        <>
+            <button
+                type="button"
+                className={`btn btn-ghost btn-sm${isInWatchlist ? ' on' : ''}`}
+                onClick={isInWatchlist ? () => handleRemoveFromWatchlist(upperTicker) : handleAddToWatchlist}
+                aria-pressed={isInWatchlist}
+            >
+                <Star size={14} aria-hidden="true" fill={isInWatchlist ? 'currentColor' : 'none'} />
+                {isInWatchlist ? 'Watching' : 'Watch'}
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={openAlertModal}>
+                <Bell size={14} aria-hidden="true" /> Set alert
+            </button>
+            <button
+                type="button"
+                className={`btn btn-ghost btn-sm${showAlerts ? ' on' : ''}`}
+                onClick={() => setShowAlerts(v => !v)}
+                aria-pressed={showAlerts}
+            >
+                Alerts {activeAlertCount > 0 && <span className="count mono">{activeAlertCount}</span>}
+            </button>
+            <button
+                type="button"
+                className={`btn btn-ghost btn-sm${showNews ? ' on' : ''}`}
+                onClick={() => setShowNews(v => !v)}
+                aria-pressed={showNews}
+            >
+                <Newspaper size={14} aria-hidden="true" /> News
+            </button>
+        </>
+    );
+
+    const changePct = isCrypto && livePrice && Number.isFinite(priceChangePercent) ? priceChangePercent : null;
+
+    return (
+        <AppShell
+            breadcrumb={['Markets', upperTicker]}
+            actions={topbarActions}
+            sidebarContent={watchlistSection}
+            onSymbolSelect={handleSymbolSelect}
+            aside={showNews ? <NewsFeed ticker={upperTicker} onClose={() => setShowNews(false)} /> : null}
+        >
+            {/* Alert notification */}
             {alertNotification && (
-                <div style={styles.alertBanner}>
-                    🔔 Alert Triggered! <strong>{alertNotification.ticker}</strong> is{' '}
-                    {alertNotification.condition === 'ABOVE' ? 'above' : 'below'}{' '}
-                    ${parseFloat(alertNotification.targetPrice).toLocaleString()}
-                    <button style={styles.bannerClose} onClick={() => setAlertNotification(null)}>✕</button>
+                <div className="toast" role="status">
+                    <BellRing size={16} aria-hidden="true" style={{ color: 'var(--warn)' }} />
+                    <span>
+                        Alert triggered: <strong className="mono">{alertNotification.ticker}</strong> is{' '}
+                        {alertNotification.condition === 'ABOVE' ? 'above' : 'below'}{' '}
+                        <span className="mono">${parseFloat(alertNotification.targetPrice).toLocaleString()}</span>
+                    </span>
+                    <button type="button" className="icon-btn" onClick={() => setAlertNotification(null)} aria-label="Dismiss alert">
+                        <X size={14} aria-hidden="true" />
+                    </button>
                 </div>
             )}
 
             {/* Alert modal */}
             {showAlertModal && (
-                <div style={styles.modalOverlay} onClick={() => setShowAlertModal(false)}>
-                    <div style={styles.modal} onClick={e => e.stopPropagation()}>
-                        <h3 style={styles.modalTitle}>Set Price Alert — {ticker}</h3>
-                        <form onSubmit={handleCreateAlert} style={styles.modalForm}>
-                            <div style={styles.modalField}>
-                                <label style={styles.modalLabel}>Condition</label>
-                                <select value={alertCondition} onChange={e => setAlertCondition(e.target.value)} style={styles.modalSelect}>
-                                    <option value="ABOVE">Price goes ABOVE</option>
-                                    <option value="BELOW">Price goes BELOW</option>
-                                </select>
-                            </div>
-                            <div style={styles.modalField}>
-                                <label style={styles.modalLabel}>Target Price (USD)</label>
-                                <input
-                                    type="number" step="any" value={alertTargetPrice}
-                                    onChange={e => setAlertTargetPrice(e.target.value)}
-                                    placeholder="Enter price..." required style={styles.modalInput}
-                                />
-                            </div>
-                            {alertError && <p style={styles.modalError}>{alertError}</p>}
-                            <div style={styles.modalActions}>
-                                <button type="button" onClick={() => setShowAlertModal(false)} style={styles.modalCancel}>Cancel</button>
-                                <button type="submit" style={styles.modalSubmit}>Create Alert</button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
+                <Modal title={<>Set price alert · <span className="mono">{upperTicker}</span></>} onClose={() => setShowAlertModal(false)}>
+                    <form onSubmit={handleCreateAlert}>
+                        <label className="field">
+                            <span className="field-label">Condition</span>
+                            <select className="select" value={alertCondition} onChange={e => setAlertCondition(e.target.value)}>
+                                <option value="ABOVE">Price goes above</option>
+                                <option value="BELOW">Price goes below</option>
+                            </select>
+                        </label>
+                        <label className="field">
+                            <span className="field-label">Target price (USD)</span>
+                            <input
+                                className="input mono" type="number" step="any" value={alertTargetPrice}
+                                onChange={e => setAlertTargetPrice(e.target.value)}
+                                placeholder="Enter price..." required
+                            />
+                        </label>
+                        {alertError && <p className="form-error">{alertError}</p>}
+                        <div className="modal-actions">
+                            <button type="button" className="btn" onClick={() => setShowAlertModal(false)}>Cancel</button>
+                            <button type="submit" className="btn btn-primary">Create alert</button>
+                        </div>
+                    </form>
+                </Modal>
             )}
 
             {/* Trade modal */}
             {showTradeModal && (
-                <div style={styles.modalOverlay} onClick={() => setShowTradeModal(false)}>
-                    <div style={styles.modal} onClick={e => e.stopPropagation()}>
-                        <h3 style={{ ...styles.modalTitle, color: tradeType === 'BUY' ? '#26a69a' : '#ef5350' }}>
-                            {tradeType} {ticker}
-                        </h3>
-                        <form onSubmit={handleTrade} style={styles.modalForm}>
-                            <div style={styles.modalField}>
-                                <label style={styles.modalLabel}>Current Price</label>
-                                <div style={{ ...styles.modalInput, color: '#d1d4dc', pointerEvents: 'none' }}>
-                                    ${livePrice ? livePrice.toLocaleString() : '—'}
-                                </div>
-                            </div>
-                            <div style={styles.modalField}>
-                                <label style={styles.modalLabel}>Quantity</label>
-                                <input
-                                    type="number" step="any" min="0"
-                                    value={tradeQuantity}
-                                    onChange={e => setTradeQuantity(e.target.value)}
-                                    placeholder="e.g. 0.01" required style={styles.modalInput}
-                                    autoFocus
-                                />
-                            </div>
-                            {tradeQuantity && livePrice && (
-                                <div style={styles.modalField}>
-                                    <label style={styles.modalLabel}>Total Cost</label>
-                                    <div style={{ color: '#d1d4dc', fontSize: '0.95rem', padding: '0.3rem 0' }}>
-                                        ${(parseFloat(tradeQuantity || 0) * livePrice).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                    </div>
-                                </div>
-                            )}
-                            {tradeType === 'BUY' && balance !== null && (
-                                <div style={{ color: '#787b86', fontSize: '0.8rem' }}>
-                                    Available: ${parseFloat(balance).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                </div>
-                            )}
-                            {tradeError && <p style={styles.modalError}>{tradeError}</p>}
-                            <div style={styles.modalActions}>
-                                <button type="button" onClick={() => setShowTradeModal(false)} style={styles.modalCancel}>Cancel</button>
-                                <button type="submit" style={tradeType === 'BUY' ? styles.buyModalBtn : styles.sellModalBtn}>
-                                    {tradeType}
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
-            )}
-
-            {/* Watchlist sidebar */}
-            <div style={styles.sidebar}>
-                <div style={styles.sidebarTitle}>Watchlist</div>
-                {watchlist.length === 0 ? (
-                    <p style={styles.emptyText}>No symbols added yet</p>
-                ) : (
-                    watchlist.map(w => (
-                        <div
-                            key={w.ticker}
-                            style={{ ...styles.watchlistItem, ...(w.ticker === ticker ? styles.watchlistItemActive : {}) }}
-                            onClick={() => { setTicker(w.ticker); setSearchInput(w.ticker); }}
-                        >
-                            <div style={styles.watchlistLeft}>
-                                <span style={styles.watchlistTicker}>{w.ticker}</span>
-                                <span style={styles.watchlistExchange}>{w.exchange}</span>
-                            </div>
-                            <div style={styles.watchlistRight}>
-                                {watchlistPrices[w.ticker]
-                                    ? <span style={styles.watchlistPrice}>${watchlistPrices[w.ticker].toLocaleString()}</span>
-                                    : <span style={styles.watchlistNoPrice}>—</span>
-                                }
-                                <button style={styles.removeBtn} onClick={e => { e.stopPropagation(); handleRemoveFromWatchlist(w.ticker); }}>✕</button>
-                            </div>
+                <Modal
+                    title={<>{tradeType === 'BUY' ? 'Buy' : 'Sell'} <span className="mono">{upperTicker}</span></>}
+                    titleClassName={tradeType === 'BUY' ? 'up' : 'down'}
+                    onClose={() => setShowTradeModal(false)}
+                >
+                    <form onSubmit={handleTrade}>
+                        <div className="field">
+                            <span className="field-label">Current price</span>
+                            <div className="input input-static mono">${livePrice ? livePrice.toLocaleString() : '—'}</div>
                         </div>
-                    ))
-                )}
-            </div>
-
-            {/* Vertical drawing tool strip */}
-            <div style={styles.toolStrip}>
-                {DRAWING_TOOLS.map((tool, i) => {
-                    const prev = i > 0 ? DRAWING_TOOLS[i - 1] : null;
-                    const showSep = prev && prev.group !== tool.group;
-                    return (
-                        <div key={tool.id}>
-                            {showSep && <div style={styles.toolSep} />}
-                            <button
-                                title={tool.label}
-                                onClick={() => selectTool(tool.id)}
-                                style={{ ...styles.toolStripBtn, ...(activeTool === tool.id ? styles.toolStripBtnOn : {}) }}
-                            >
-                                <span style={styles.toolIcon}>{tool.icon}</span>
-                                <span style={styles.toolLabel}>{tool.label.split(' ')[0]}</span>
+                        <label className="field">
+                            <span className="field-label">Quantity</span>
+                            <input
+                                className="input mono" type="number" step="any" min="0"
+                                value={tradeQuantity}
+                                onChange={e => setTradeQuantity(e.target.value)}
+                                placeholder="e.g. 0.01" required autoFocus
+                            />
+                        </label>
+                        {tradeQuantity && livePrice && (
+                            <div className="field">
+                                <span className="field-label">Total</span>
+                                <span className="mono" style={{ fontSize: 16 }}>${fmtMoney(parseFloat(tradeQuantity || 0) * livePrice)}</span>
+                            </div>
+                        )}
+                        {tradeType === 'BUY' && balance !== null && (
+                            <p className="note">Available: <span className="mono">${fmtMoney(balance)}</span></p>
+                        )}
+                        {tradeError && <p className="form-error">{tradeError}</p>}
+                        <div className="modal-actions">
+                            <button type="button" className="btn" onClick={() => setShowTradeModal(false)}>Cancel</button>
+                            <button type="submit" className={`btn ${tradeType === 'BUY' ? 'btn-up' : 'btn-down'}`}>
+                                {tradeType === 'BUY' ? 'Buy' : 'Sell'}
                             </button>
                         </div>
-                    );
-                })}
-
-                {drawings.length > 0 && (
-                    <>
-                        <div style={styles.toolSep} />
-                        <div style={styles.drawingCountBadge} title={`${drawings.length} drawing${drawings.length > 1 ? 's' : ''} on chart`}>
-                            <span style={styles.toolIcon}>◈</span>
-                            <span style={styles.toolLabel}>{drawings.length}</span>
-                        </div>
-                    </>
-                )}
-            </div>
-
-            {/* Main content */}
-            <div style={styles.main}>
-
-                {/* Header */}
-                <div style={styles.header}>
-                    <span style={styles.logo}>TradingView Clone</span>
-                    <form onSubmit={handleSearch} style={styles.searchForm}>
-                        <div style={styles.searchWrapper}>
-                            <input
-                                type="text" value={searchInput}
-                                onChange={e => { setSearchInput(e.target.value); setShowDropdown(true); }}
-                                onFocus={() => setShowDropdown(true)}
-                                onBlur={() => setTimeout(() => setShowDropdown(false), 150)}
-                                placeholder="Search symbol..." style={styles.searchInput}
-                            />
-                            {showDropdown && filteredSymbols.length > 0 && (
-                                <div style={styles.dropdown}>
-                                    {filteredSymbols.map(s => (
-                                        <div key={s.ticker} style={styles.dropdownItem} onMouseDown={() => handleSymbolSelect(s.ticker)}>
-                                            <span style={styles.dropdownTicker}>{s.ticker}</span>
-                                            <span style={styles.dropdownName}>{s.name}</span>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                        <button type="submit" style={styles.searchButton}>Search</button>
                     </form>
+                </Modal>
+            )}
 
-                    <button
-                        onClick={isInWatchlist ? () => handleRemoveFromWatchlist(ticker) : handleAddToWatchlist}
-                        style={{ ...styles.headerBtn, ...(isInWatchlist ? styles.headerBtnActive : {}) }}
-                    >
-                        {isInWatchlist ? '★ Watching' : '☆ Watchlist'}
-                    </button>
-                    <button onClick={openAlertModal} style={styles.headerBtn}>🔔 Set Alert</button>
-                    <button
-                        onClick={() => setShowAlerts(v => !v)}
-                        style={{ ...styles.headerBtn, ...(showAlerts ? styles.headerBtnActive : {}) }}
-                    >
-                        Alerts {alerts.filter(a => a.status === 'ACTIVE').length > 0 && `(${alerts.filter(a => a.status === 'ACTIVE').length})`}
-                    </button>
-                    <button
-                        onClick={() => setShowNews(v => !v)}
-                        style={{ ...styles.headerBtn, ...(showNews ? styles.headerBtnActive : {}) }}
-                    >
-                        📰 News
-                    </button>
-                    <button onClick={() => navigate('/portfolio')} style={styles.headerBtn}>Portfolio</button>
-                    <button onClick={handleLogout} style={styles.logoutButton}>Logout</button>
-                </div>
-
-                {watchlistError && <p style={styles.errorMsg}>{watchlistError}</p>}
-
-                {/* Price bar */}
-                <div style={styles.priceBar}>
-                    <span style={styles.tickerName}>{ticker}</span>
-                    {livePrice ? (
-                        <>
-                            <span style={styles.price}>${livePrice.toLocaleString()}</span>
-                            {isCrypto && (
-                                <span style={{ ...styles.change, color: isPositive ? '#26a69a' : '#ef5350' }}>
-                                    {isPositive ? '▲' : '▼'} {Math.abs(priceChange).toFixed(2)} ({Math.abs(priceChangePercent).toFixed(2)}%)
-                                </span>
-                            )}
-                        </>
-                    ) : <span style={styles.noPrice}>Connecting...</span>}
-
-                    <div style={styles.tradeBar}>
-                        <span style={styles.balanceDisplay}>
-                            ${balance !== null ? parseFloat(balance).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '...'}
-                        </span>
-                        <button onClick={() => openTradeModal('BUY')} style={styles.buyBtn}>Buy</button>
-                        <button onClick={() => openTradeModal('SELL')} style={styles.sellBtn}>Sell</button>
+            {/* Symbol header */}
+            <div className="symbol-header">
+                <div>
+                    <p className="eyebrow">
+                        {[symbolInfo?.exchange || (isCrypto ? 'BINANCE' : null), symbolInfo?.name, isCrypto ? 'Crypto' : 'Stock']
+                            .filter(Boolean).join(' · ')}
+                    </p>
+                    <div className="symbol-title">
+                        <TickerAvatar ticker={upperTicker} size={30} />
+                        <h1 className="mono">{upperTicker}</h1>
+                        {livePrice ? (
+                            <>
+                                <span className="symbol-price mono">${livePrice.toLocaleString()}</span>
+                                {changePct !== null && <ChangePill value={changePct} label="24h change" />}
+                                {changePct !== null && Number.isFinite(priceChange) && (
+                                    <span className={`mono ${priceChange >= 0 ? 'up' : 'down'}`} style={{ fontSize: 13 }}>
+                                        {priceChange >= 0 ? '+' : '−'}${Math.abs(priceChange).toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                                    </span>
+                                )}
+                            </>
+                        ) : (
+                            <span className="muted">Waiting for live price…</span>
+                        )}
                     </div>
                 </div>
+                <div className="trade-actions">
+                    <div className="balance">
+                        <span className="label">Cash balance</span>
+                        <span className="value mono">${balance !== null ? fmtMoney(balance) : '…'}</span>
+                    </div>
+                    <button type="button" className="btn btn-up btn-lg" onClick={() => openTradeModal('BUY')}>Buy</button>
+                    <button type="button" className="btn btn-down btn-lg" onClick={() => openTradeModal('SELL')}>Sell</button>
+                </div>
+            </div>
 
-                {/* Interval + Indicators bar */}
-                <div style={styles.intervalBar}>
-                    {INTERVALS.map(i => (
-                        <button
-                            key={i} onClick={() => setInterval(i)}
-                            style={{ ...styles.intervalBtn, ...(interval === i ? styles.intervalBtnActive : {}) }}
-                        >
-                            {i}
-                        </button>
-                    ))}
+            {watchlistError && <p className="banner-error">{watchlistError}</p>}
+            {error && <p className="banner-error">{error}</p>}
 
-                    <div style={styles.intervalSep} />
+            {/* Alerts */}
+            {showAlerts && (
+                <section className="card" aria-labelledby="alerts-title">
+                    <div className="card-header">
+                        <div>
+                            <h2 id="alerts-title" className="card-title">Alerts</h2>
+                            <p className="card-subtitle">Active price alerts for <span className="mono">{upperTicker}</span></p>
+                        </div>
+                        <button type="button" className="btn btn-sm" onClick={openAlertModal}><Plus size={14} aria-hidden="true" /> New alert</button>
+                    </div>
+                    <div className="card-body">
+                        {tickerAlerts.length === 0 && <p className="muted">No active alerts for {upperTicker}.</p>}
+                        {tickerAlerts.map(a => (
+                            <div key={a.id} className="alert-row">
+                                <span className={`pill ${a.condition === 'ABOVE' ? 'pill-up' : 'pill-down'}`}>
+                                    {a.condition === 'ABOVE' ? '▲ Above' : '▼ Below'}
+                                </span>
+                                <span className="grow mono">${parseFloat(a.targetPrice).toLocaleString()}</span>
+                                <button type="button" className="btn btn-sm" onClick={() => handleCancelAlert(a.id)}>Cancel</button>
+                            </div>
+                        ))}
+                        {triggeredAlerts.length > 0 && (
+                            <>
+                                <p className="section-label">Triggered</p>
+                                {triggeredAlerts.map(a => (
+                                    <div key={a.id} className="alert-row">
+                                        <span className={`pill ${a.condition === 'ABOVE' ? 'pill-up' : 'pill-down'}`}>
+                                            {a.condition === 'ABOVE' ? '▲ Above' : '▼ Below'}
+                                        </span>
+                                        <span className="grow mono">{a.ticker} @ ${parseFloat(a.targetPrice).toLocaleString()}</span>
+                                        <span className="pill pill-neutral"><Check size={12} aria-hidden="true" /> Triggered</span>
+                                        <button type="button" className="btn btn-sm btn-ghost" onClick={() => handleDeleteAlert(a.id)}>Delete</button>
+                                    </div>
+                                ))}
+                            </>
+                        )}
+                    </div>
+                </section>
+            )}
 
-                    {/* Indicator toggle buttons */}
+            {/* Chart */}
+            <section className="card chart-card" aria-label={`${upperTicker} chart`}>
+                <div className="chart-toolbar">
+                    <div className="segmented" role="group" aria-label="Interval">
+                        {INTERVALS.map(i => (
+                            <button key={i} type="button" onClick={() => setInterval(i)} aria-pressed={interval === i}>{i}</button>
+                        ))}
+                    </div>
+
+                    <span className="toolbar-sep" aria-hidden="true" />
+
                     <div style={{ position: 'relative' }}>
                         <button
+                            type="button"
+                            className={`btn btn-sm${showIndicatorMenu ? ' on' : ''}`}
                             onClick={() => setShowIndicatorMenu(v => !v)}
-                            style={{ ...styles.indicatorMenuBtn, ...(activeIndicators.size > 0 ? styles.indicatorMenuBtnOn : {}) }}
+                            aria-expanded={showIndicatorMenu}
                         >
-                            ƒ Indicators {activeIndicators.size + (predictionEnabled ? 1 : 0) > 0 && `(${activeIndicators.size + (predictionEnabled ? 1 : 0)})`}
+                            <Layers size={14} aria-hidden="true" /> Indicators
+                            {indicatorCount > 0 && <span className="count mono">{indicatorCount}</span>}
                         </button>
 
                         {showIndicatorMenu && (
-                            <div style={styles.indicatorMenu}>
-                                <div style={styles.indicatorMenuTitle}>Moving Averages</div>
+                            <div className="menu">
+                                <div className="menu-label">Moving averages</div>
                                 {INDICATOR_DEFS.filter(d => d.group === 'MA').map(def => (
-                                    <button
-                                        key={def.id}
-                                        onClick={() => toggleIndicator(def.id)}
-                                        style={{
-                                            ...styles.indicatorMenuItem,
-                                            ...(activeIndicators.has(def.id) ? styles.indicatorMenuItemOn : {}),
-                                        }}
-                                    >
-                                        <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: def.color, marginRight: 6 }} />
+                                    <button key={def.id} type="button" className="menu-item" onClick={() => toggleIndicator(def.id)} aria-pressed={activeIndicators.has(def.id)}>
+                                        <span className="dot" style={{ background: def.color }} aria-hidden="true" />
                                         {def.label}
-                                        {activeIndicators.has(def.id) && <span style={styles.checkMark}>✓</span>}
+                                        {activeIndicators.has(def.id) && <Check size={14} className="check" aria-hidden="true" />}
                                     </button>
                                 ))}
-                                <div style={{ ...styles.indicatorMenuTitle, marginTop: 8 }}>Bands</div>
+                                <div className="menu-label">Bands</div>
                                 {INDICATOR_DEFS.filter(d => d.group === 'BB').map(def => (
-                                    <button
-                                        key={def.id}
-                                        onClick={() => toggleIndicator(def.id)}
-                                        style={{
-                                            ...styles.indicatorMenuItem,
-                                            ...(activeIndicators.has(def.id) ? styles.indicatorMenuItemOn : {}),
-                                        }}
-                                    >
-                                        <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: def.color, marginRight: 6 }} />
+                                    <button key={def.id} type="button" className="menu-item" onClick={() => toggleIndicator(def.id)} aria-pressed={activeIndicators.has(def.id)}>
+                                        <span className="dot" style={{ background: def.color }} aria-hidden="true" />
                                         {def.label}
-                                        {activeIndicators.has(def.id) && <span style={styles.checkMark}>✓</span>}
+                                        {activeIndicators.has(def.id) && <Check size={14} className="check" aria-hidden="true" />}
                                     </button>
                                 ))}
                                 {interval === PREDICTION_INTERVAL && (
                                     <>
-                                        <div style={{ ...styles.indicatorMenuTitle, marginTop: 8 }}>Model</div>
-                                        <button
-                                            onClick={() => setShowPrediction(!showPrediction)}
-                                            aria-pressed={showPrediction}
-                                            style={{
-                                                ...styles.indicatorMenuItem,
-                                                ...(showPrediction ? styles.indicatorMenuItemOn : {}),
-                                            }}
-                                        >
-                                            <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', backgroundColor: PREDICTION_COLOR, marginRight: 6 }} />
+                                        <div className="menu-label">Model</div>
+                                        <button type="button" className="menu-item" onClick={() => setShowPrediction(!showPrediction)} aria-pressed={showPrediction}>
+                                            <span className="dot" style={{ background: PREDICTION_COLOR }} aria-hidden="true" />
                                             Model prediction
-                                            {showPrediction && <span style={styles.checkMark}>✓</span>}
+                                            {showPrediction && <Check size={14} className="check" aria-hidden="true" />}
                                         </button>
                                     </>
                                 )}
@@ -1179,69 +1189,47 @@ export default function ChartPage() {
                         )}
                     </div>
 
-                    {/* Active indicator pills */}
                     {INDICATOR_DEFS.filter(d => activeIndicators.has(d.id)).map(def => (
-                        <span key={def.id} style={{ ...styles.indicatorPill, borderColor: def.color, color: def.color }}>
+                        <span key={def.id} className="chip">
+                            <span className="dot" style={{ background: def.color }} aria-hidden="true" />
                             {def.label}
-                            <button onClick={() => toggleIndicator(def.id)} style={styles.indicatorPillClose}>✕</button>
+                            <button type="button" onClick={() => toggleIndicator(def.id)} aria-label={`Remove ${def.label}`}><X size={12} aria-hidden="true" /></button>
                         </span>
                     ))}
                     {predictionEnabled && (
-                        <span style={{ ...styles.indicatorPill, borderColor: PREDICTION_COLOR, color: PREDICTION_COLOR }}>
+                        <span className="chip">
+                            <span className="dot" style={{ background: PREDICTION_COLOR }} aria-hidden="true" />
                             Model
-                            <button onClick={() => setShowPrediction(false)} style={styles.indicatorPillClose}
-                                aria-label="Hide model prediction">✕</button>
+                            <button type="button" onClick={() => setShowPrediction(false)} aria-label="Hide model prediction"><X size={12} aria-hidden="true" /></button>
                         </span>
                     )}
                 </div>
 
-                {error && <p style={styles.errorMsg}>{error}</p>}
-
-                {/* Drawing options bar — visible when a drawing tool is active */}
+                {/* Drawing options — while a drawing tool is active */}
                 {activeTool !== 'select' && (
-                    <div style={styles.drawingBar}>
-                        <span style={styles.drawingBarLabel}>
-                            {DRAWING_TOOLS.find(t => t.id === activeTool)?.label}
-                        </span>
-
-                        {/* Color picker */}
-                        <div style={styles.swatchRow}>
+                    <div className="subbar">
+                        <strong style={{ color: 'var(--text)', fontWeight: 500 }}>{DRAWING_TOOLS.find(t => t.id === activeTool)?.label}</strong>
+                        <div className="button-row" role="group" aria-label="Line colour">
                             {DRAW_COLORS.map(c => (
-                                <button
-                                    key={c}
-                                    onClick={() => changeColor(c)}
-                                    title={c}
-                                    style={{
-                                        ...styles.swatch,
-                                        backgroundColor: c,
-                                        outline: activeColor === c ? '2px solid #fff' : 'none',
-                                        outlineOffset: '2px',
-                                    }}
-                                />
+                                <button key={c} type="button" className="swatch" onClick={() => changeColor(c)}
+                                    aria-label={`Colour ${c}`} aria-pressed={activeColor === c} style={{ background: c }} />
                             ))}
                         </div>
-
-                        {/* Line width */}
-                        <div style={styles.widthRow}>
+                        <div className="button-row" role="group" aria-label="Line width" style={{ gap: 4 }}>
                             {DRAW_WIDTHS.map(w => (
-                                <button
-                                    key={w}
-                                    onClick={() => changeWidth(w)}
-                                    title={`Width ${w}`}
-                                    style={{ ...styles.widthBtn, ...(activeWidth === w ? styles.widthBtnOn : {}) }}
-                                >
-                                    <div style={{ width: 18, height: Math.max(1, Math.round(w)), backgroundColor: activeColor, borderRadius: 1 }} />
+                                <button key={w} type="button" className="width-btn" onClick={() => changeWidth(w)}
+                                    aria-label={`Width ${w}`} aria-pressed={activeWidth === w}>
+                                    <span style={{ width: 16, height: Math.max(1, Math.round(w)), background: activeColor, borderRadius: 1 }} />
                                 </button>
                             ))}
                         </div>
-
-                        <span style={styles.drawingHint}>
-                            {awaitingSecondClick ? '📍 Click 2nd point to finish' : '✦ Click on chart to start'}
+                        <span className={awaitingSecondClick ? 'hint-warn' : 'hint'}>
+                            {awaitingSecondClick ? 'Click the second point to finish' : 'Click on the chart to start'}
                         </span>
-
                         {awaitingSecondClick && (
                             <button
-                                style={styles.escBtn}
+                                type="button"
+                                className="btn btn-sm spacer"
                                 onClick={() => {
                                     if (previewPrimRef.current && seriesRef.current) {
                                         seriesRef.current.detachPrimitive(previewPrimRef.current);
@@ -1251,446 +1239,160 @@ export default function ChartPage() {
                                     setAwaitingSecondClick(false);
                                 }}
                             >
-                                Esc
+                                Cancel <span className="kbd">Esc</span>
                             </button>
                         )}
                     </div>
                 )}
 
-                {/* Selection info bar — shown when a drawing is selected */}
+                {/* A drawing is selected */}
                 {selectedId != null && activeTool === 'select' && selectedDrawing && (
-                    <div style={styles.selBar}>
-                        <span style={styles.selDot} />
-                        <span style={styles.selText}>{selectedDrawing.label} selected</span>
-                        <button onClick={() => deleteDrawingById(selectedId)} style={styles.selDelete}>
-                            🗑 Delete this drawing
+                    <div className="subbar">
+                        <span className="dot" style={{ background: 'var(--up)' }} aria-hidden="true" />
+                        <span style={{ color: 'var(--text)' }}>{selectedDrawing.label} selected</span>
+                        <button type="button" className="btn btn-sm btn-danger-ghost" onClick={() => deleteDrawingById(selectedId)}>
+                            <Trash2 size={13} aria-hidden="true" /> Delete
                         </button>
                         <button
+                            type="button"
+                            className="btn btn-sm"
                             onClick={() => {
                                 drawingsRef.current.forEach(d => d.primitive.setSelected(false));
                                 selectedIdRef.current = null;
                                 setSelectedId(null);
                             }}
-                            style={styles.selClose}
                         >
-                            ✕ Deselect
+                            Deselect
                         </button>
-                        <span style={styles.selHint}>or press Delete key</span>
+                        <span className="hint spacer">or press <span className="kbd">Delete</span></span>
                     </div>
                 )}
 
-                {/* Select-mode hint bar — shown when in select mode, nothing selected, but drawings exist */}
+                {/* Select mode with drawings on the chart */}
                 {activeTool === 'select' && selectedId == null && drawings.length > 0 && (
-                    <div style={styles.selectHintBar}>
-                        <span style={styles.selectHintText}>
-                            ↖ Click on a drawing to select it, then press <kbd style={styles.kbd}>Delete</kbd> or use the Delete button
-                        </span>
-                        <button onClick={clearAllDrawings} style={styles.clearAllBtn}>
-                            🗑 Clear All ({drawings.length})
+                    <div className="subbar">
+                        <span className="hint">Click a drawing to select it, then press <span className="kbd">Delete</span>.</span>
+                        <button type="button" className="btn btn-sm btn-danger-ghost spacer" onClick={clearAllDrawings}>
+                            <Trash2 size={13} aria-hidden="true" /> Clear all ({drawings.length})
                         </button>
                     </div>
                 )}
 
-                {/* Alerts panel */}
-                {showAlerts && (
-                    <div style={styles.alertsPanel}>
-                        <div style={styles.alertsPanelTitle}>
-                            Active Alerts for {ticker}
-                            {tickerAlerts.length === 0 && <span style={styles.noAlertsText}> — none set</span>}
-                        </div>
-                        {tickerAlerts.map(a => (
-                            <div key={a.id} style={styles.alertRow}>
-                                <span style={styles.alertConditionBadge(a.condition)}>
-                                    {a.condition === 'ABOVE' ? '▲' : '▼'} {a.condition}
-                                </span>
-                                <span style={styles.alertPrice}>${parseFloat(a.targetPrice).toLocaleString()}</span>
-                                <button style={styles.cancelAlertBtn} onClick={() => handleCancelAlert(a.id)}>Cancel</button>
-                            </div>
-                        ))}
-                        {alerts.filter(a => a.status === 'TRIGGERED').length > 0 && (
-                            <>
-                                <div style={{ ...styles.alertsPanelTitle, marginTop: '0.75rem' }}>Triggered</div>
-                                {alerts.filter(a => a.status === 'TRIGGERED').map(a => (
-                                    <div key={a.id} style={styles.alertRow}>
-                                        <span style={styles.alertConditionBadge(a.condition)}>
-                                            {a.condition === 'ABOVE' ? '▲' : '▼'} {a.condition}
-                                        </span>
-                                        <span style={styles.alertPrice}>{a.ticker} @ ${parseFloat(a.targetPrice).toLocaleString()}</span>
-                                        <span style={{ color: '#26a69a', fontSize: '0.75rem' }}>✓ Triggered</span>
-                                        <button style={styles.cancelAlertBtn} onClick={() => handleDeleteAlert(a.id)}>✕ Delete</button>
-                                    </div>
-                                ))}
-                            </>
+                <div className="chart-body">
+                    <div className="tool-rail" role="toolbar" aria-label="Drawing tools" aria-orientation="vertical">
+                        {DRAWING_TOOLS.map((tool, i) => {
+                            const prev = i > 0 ? DRAWING_TOOLS[i - 1] : null;
+                            const { Icon } = tool;
+                            return (
+                                <div key={tool.id} style={{ display: 'contents' }}>
+                                    {prev && prev.group !== tool.group && <span className="rail-sep" aria-hidden="true" />}
+                                    <button
+                                        type="button"
+                                        className="tool"
+                                        title={tool.label}
+                                        aria-label={tool.label}
+                                        aria-pressed={activeTool === tool.id}
+                                        onClick={() => selectTool(tool.id)}
+                                    >
+                                        <Icon size={16} aria-hidden="true" />
+                                    </button>
+                                </div>
+                            );
+                        })}
+                        {drawings.length > 0 && (
+                            <span className="rail-count mono" title={`${drawings.length} drawing${drawings.length > 1 ? 's' : ''} on chart`}>
+                                {drawings.length}
+                            </span>
                         )}
                     </div>
-                )}
 
-                {/* Chart + OHLCV tooltip overlay */}
-                <div style={styles.chartWrapper}>
-                    <div style={{ position: 'relative' }}>
+                    <div className="chart-area">
                         <div
                             ref={chartContainerRef}
+                            className="chart-canvas"
                             style={{
-                            ...styles.chart,
-                            cursor: activeTool !== 'select'
-                                ? 'crosshair'
-                                : isDragging
-                                    ? 'grabbing'
-                                    : selectedId != null ? 'grab' : 'default'
-                        }}
+                                cursor: activeTool !== 'select'
+                                    ? 'crosshair'
+                                    : isDragging ? 'grabbing' : selectedId != null ? 'grab' : 'default',
+                            }}
                         />
 
                         {/* Model prediction legend */}
                         {predictionEnabled && (
-                            <div style={styles.predictionLegend} role="status" aria-live="polite">
+                            <div className="chart-overlay prediction-legend" role="status" aria-live="polite">
                                 {currentPredictionError ? (
-                                    <span style={styles.predictionLegendMuted}>{currentPredictionError}</span>
+                                    <span>{currentPredictionError}</span>
                                 ) : !currentPrediction ? (
-                                    <span style={styles.predictionLegendMuted}>Loading model prediction…</span>
+                                    <span>Loading model prediction…</span>
                                 ) : currentPrediction.status !== 'ready' ? (
-                                    <span style={styles.predictionLegendMuted}>No model trained for {upperTicker} yet.</span>
+                                    <span>No model trained for {upperTicker} yet.</span>
                                 ) : (
                                     <>
                                         {currentPrediction.prediction && (
-                                            <div style={{
-                                                ...styles.predictionLegendHeadline,
-                                                color: currentPrediction.prediction.direction === 'UP' ? '#26a69a'
-                                                    : currentPrediction.prediction.direction === 'DOWN' ? '#ef5350' : '#d1d4dc',
-                                            }}>
+                                            <div className={`headline ${currentPrediction.prediction.direction === 'UP' ? 'up' : currentPrediction.prediction.direction === 'DOWN' ? 'down' : ''}`}>
+                                                <span className="dot" style={{ background: PREDICTION_COLOR }} aria-hidden="true" />
                                                 Model: {describePrediction(currentPrediction.prediction)}
-                                                <span style={styles.predictionLegendMuted}>
-                                                    {' '}· as of {currentPrediction.prediction.asOfDate} close
-                                                </span>
+                                                <span className="muted"> · as of {currentPrediction.prediction.asOfDate} close</span>
                                             </div>
                                         )}
                                         {predictionOverlay?.stale && (
-                                            <div style={styles.predictionLegendWarn}>Prediction is out of date; refresh it to update.</div>
+                                            <div className="warn">Prediction is out of date; refresh it to update.</div>
                                         )}
                                         {currentPrediction.backtest?.metrics && (
-                                            <div style={styles.predictionLegendMuted}>
+                                            <div>
                                                 Backtest {currentPrediction.backtest.start} – {currentPrediction.backtest.end}:{' '}
-                                                {formatPct(currentPrediction.backtest.metrics.directionalAccuracy)} direction accuracy
-                                                {' '}(always-majority baseline {formatPct(currentPrediction.backtest.metrics.majorityBaseline)},
+                                                <span className="mono">{formatPct(currentPrediction.backtest.metrics.directionalAccuracy)}</span> direction accuracy
+                                                {' '}(always-majority baseline <span className="mono">{formatPct(currentPrediction.backtest.metrics.majorityBaseline)}</span>,
                                                 n={currentPrediction.backtest.metrics.n})
                                                 {!predictionOverlay?.backtestLine.length && ' · outside the loaded candles'}
                                             </div>
                                         )}
                                         {!currentPrediction.hasNews && (
-                                            <div style={styles.predictionLegendMuted}>No news coverage: price and technical features only.</div>
+                                            <div>No news coverage: price and technical features only.</div>
                                         )}
-                                        <div style={styles.predictionLegendMuted}>Research model, not trading advice.</div>
+                                        <div className="muted">Research model, not trading advice.</div>
                                     </>
                                 )}
                             </div>
                         )}
 
-                        {/* OHLCV floating tooltip — adapted from lightweight-charts tooltip plugin */}
+                        {/* OHLC tooltip */}
                         {tooltipData && (
-                            <div style={{
-                                ...styles.ohlcvTooltip,
-                                left: tooltipPos.x < 200 ? tooltipPos.x + 12 : tooltipPos.x - 148,
-                                top: Math.max(8, tooltipPos.y - 72),
-                            }}>
-                                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                                    {[
-                                        { label: 'O', value: tooltipData.open },
-                                        { label: 'H', value: tooltipData.high },
-                                        { label: 'L', value: tooltipData.low },
-                                        { label: 'C', value: tooltipData.close },
-                                    ].map(({ label, value }) => (
-                                        <div key={label} style={styles.ohlcvItem}>
-                                            <span style={styles.ohlcvLabel}>{label}</span>
-                                            <span style={{ ...styles.ohlcvValue, color: tooltipData.isUp ? '#26a69a' : '#ef5350' }}>
-                                                {value}
-                                            </span>
-                                        </div>
-                                    ))}
-                                </div>
+                            <div
+                                className="chart-overlay ohlc-tooltip"
+                                style={{
+                                    left: tooltipPos.x < 200 ? tooltipPos.x + 60 : tooltipPos.x - 100,
+                                    top: Math.max(8, tooltipPos.y - 64),
+                                }}
+                            >
+                                {[
+                                    { label: 'O', value: tooltipData.open },
+                                    { label: 'H', value: tooltipData.high },
+                                    { label: 'L', value: tooltipData.low },
+                                    { label: 'C', value: tooltipData.close },
+                                ].map(({ label, value }) => (
+                                    <div key={label} className="item">
+                                        <span className="k">{label}</span>
+                                        <span className={`v mono ${tooltipData.isUp ? 'up' : 'down'}`}>{value}</span>
+                                    </div>
+                                ))}
                             </div>
                         )}
                     </div>
-
-                    {/* Model details and Refresh / Retrain controls. Keyed by ticker so
-                        per-ticker UI state (confirmations, messages) starts fresh. */}
-                    {predictionEnabled && (
-                        <PredictionPanel
-                            key={upperTicker}
-                            ticker={upperTicker}
-                            model={currentPrediction}
-                            loadError={currentPredictionError}
-                            onFinished={reloadPrediction}
-                        />
-                    )}
                 </div>
+            </section>
 
-            </div>
-
-            {/* News right sidebar */}
-            {showNews && <NewsFeed ticker={ticker} />}
-
-        </div>
+            {/* Model details and Refresh / Retrain controls. Keyed by ticker so
+                per-ticker UI state (confirmations, messages) starts fresh. */}
+            {predictionEnabled && (
+                <PredictionPanel
+                    key={upperTicker}
+                    ticker={upperTicker}
+                    model={currentPrediction}
+                    loadError={currentPredictionError}
+                    onFinished={reloadPrediction}
+                />
+            )}
+        </AppShell>
     );
 }
-
-// ─── Styles ───────────────────────────────────────────────────────────────────
-
-const styles = {
-    page: { backgroundColor: '#131722', height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'row' },
-
-    alertBanner: {
-        position: 'fixed', top: 0, left: 0, right: 0, zIndex: 1000,
-        backgroundColor: '#2962ff', color: '#fff',
-        padding: '0.75rem 1.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem',
-        fontSize: '0.95rem',
-    },
-    bannerClose: { marginLeft: 'auto', backgroundColor: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1rem' },
-
-    modalOverlay: {
-        position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500,
-    },
-    modal: { backgroundColor: '#1e222d', border: '1px solid #363a45', borderRadius: '8px', padding: '2rem', width: '340px' },
-    modalTitle: { color: '#d1d4dc', fontSize: '1rem', margin: '0 0 1.5rem' },
-    modalForm: { display: 'flex', flexDirection: 'column', gap: '1rem' },
-    modalField: { display: 'flex', flexDirection: 'column', gap: '0.4rem' },
-    modalLabel: { color: '#787b86', fontSize: '0.8rem' },
-    modalSelect: { backgroundColor: '#2a2e39', border: '1px solid #363a45', borderRadius: '4px', padding: '0.6rem', color: '#d1d4dc', fontSize: '0.9rem' },
-    modalInput: { backgroundColor: '#2a2e39', border: '1px solid #363a45', borderRadius: '4px', padding: '0.6rem', color: '#d1d4dc', fontSize: '0.9rem', outline: 'none' },
-    modalError: { color: '#f7525f', fontSize: '0.8rem', margin: 0 },
-    modalActions: { display: 'flex', gap: '0.75rem', marginTop: '0.5rem' },
-    modalCancel: { flex: 1, backgroundColor: 'transparent', border: '1px solid #363a45', borderRadius: '4px', padding: '0.6rem', color: '#787b86', cursor: 'pointer' },
-    modalSubmit: { flex: 1, backgroundColor: '#2962ff', border: 'none', borderRadius: '4px', padding: '0.6rem', color: '#fff', cursor: 'pointer' },
-
-    sidebar: {
-        width: '220px', minWidth: '220px', backgroundColor: '#1e222d',
-        borderRight: '1px solid #2a2e39', display: 'flex', flexDirection: 'column', overflowY: 'auto',
-    },
-    sidebarTitle: {
-        color: '#787b86', fontSize: '0.7rem', fontWeight: 'bold', letterSpacing: '0.1em',
-        padding: '0.75rem 1rem 0.5rem', borderBottom: '1px solid #2a2e39', textTransform: 'uppercase',
-    },
-    emptyText: { color: '#787b86', fontSize: '0.8rem', padding: '1rem', textAlign: 'center' },
-    watchlistItem: {
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '0.6rem 0.75rem', borderBottom: '1px solid #2a2e39', cursor: 'pointer',
-    },
-    watchlistItemActive: { backgroundColor: '#2a2e39' },
-    watchlistLeft: { display: 'flex', flexDirection: 'column', gap: '0.15rem' },
-    watchlistTicker: { color: '#d1d4dc', fontSize: '0.85rem', fontWeight: 'bold' },
-    watchlistExchange: { color: '#787b86', fontSize: '0.7rem' },
-    watchlistRight: { display: 'flex', alignItems: 'center', gap: '0.4rem' },
-    watchlistPrice: { color: '#26a69a', fontSize: '0.78rem' },
-    watchlistNoPrice: { color: '#787b86', fontSize: '0.78rem' },
-    removeBtn: { backgroundColor: 'transparent', border: 'none', color: '#787b86', cursor: 'pointer', fontSize: '0.75rem', padding: '0 2px' },
-
-    // Vertical tool strip (between sidebar and main)
-    toolStrip: {
-        width: '48px', minWidth: '48px',
-        backgroundColor: '#1e222d',
-        borderRight: '1px solid #2a2e39',
-        display: 'flex', flexDirection: 'column', alignItems: 'center',
-        paddingTop: '6px', paddingBottom: '6px', gap: '2px',
-        overflowY: 'auto',
-    },
-    toolSep: { width: '28px', height: '1px', backgroundColor: '#2a2e39', margin: '4px auto' },
-    toolStripBtn: {
-        width: '40px', height: '40px',
-        backgroundColor: 'transparent',
-        border: '1px solid transparent',
-        borderRadius: '5px',
-        cursor: 'pointer',
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-        gap: '1px', color: '#787b86',
-    },
-    toolStripBtnOn: { backgroundColor: '#2962ff20', color: '#2962ff', border: '1px solid #2962ff50' },
-    toolIcon: { fontSize: '14px', lineHeight: 1 },
-    toolLabel: { fontSize: '9px', letterSpacing: '-0.02em', lineHeight: 1 },
-
-    main: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' },
-
-    header: {
-        display: 'flex', alignItems: 'center', padding: '0.75rem 1.5rem',
-        backgroundColor: '#1e222d', borderBottom: '1px solid #2a2e39', gap: '0.75rem', flexWrap: 'wrap',
-    },
-    logo: { color: '#d1d4dc', fontWeight: 'bold', fontSize: '1rem', whiteSpace: 'nowrap' },
-    searchForm: { display: 'flex', gap: '0.5rem', flex: 1, maxWidth: '380px' },
-    searchWrapper: { position: 'relative', flex: 1 },
-    searchInput: {
-        width: '100%', boxSizing: 'border-box', backgroundColor: '#2a2e39',
-        border: '1px solid #363a45', borderRadius: '4px',
-        padding: '0.5rem 0.75rem', color: '#d1d4dc', fontSize: '0.9rem', outline: 'none',
-    },
-    dropdown: {
-        position: 'absolute', top: '100%', left: 0, right: 0,
-        backgroundColor: '#1e222d', border: '1px solid #363a45', borderRadius: '4px',
-        zIndex: 100, maxHeight: '250px', overflowY: 'auto',
-    },
-    dropdownItem: {
-        display: 'flex', justifyContent: 'space-between',
-        padding: '0.6rem 0.75rem', cursor: 'pointer', borderBottom: '1px solid #2a2e39',
-    },
-    dropdownTicker: { color: '#d1d4dc', fontWeight: 'bold', fontSize: '0.85rem' },
-    dropdownName: { color: '#787b86', fontSize: '0.8rem' },
-    searchButton: { backgroundColor: '#2962ff', color: '#fff', border: 'none', borderRadius: '4px', padding: '0.5rem 1rem', cursor: 'pointer', fontSize: '0.9rem' },
-    headerBtn: {
-        backgroundColor: 'transparent', color: '#787b86', border: '1px solid #363a45',
-        borderRadius: '4px', padding: '0.45rem 0.75rem', cursor: 'pointer', fontSize: '0.82rem', whiteSpace: 'nowrap',
-    },
-    headerBtnActive: { color: '#f5c518', borderColor: '#f5c518' },
-    logoutButton: { backgroundColor: 'transparent', color: '#787b86', border: '1px solid #363a45', borderRadius: '4px', padding: '0.45rem 0.75rem', cursor: 'pointer', fontSize: '0.82rem' },
-    balanceDisplay: { color: '#26a69a', fontSize: '0.82rem', fontWeight: 'bold', whiteSpace: 'nowrap', padding: '0.45rem 0.75rem', border: '1px solid #26a69a40', borderRadius: '4px', backgroundColor: '#26a69a10' },
-    buyBtn: { backgroundColor: '#26a69a', color: '#fff', border: 'none', borderRadius: '4px', padding: '0.45rem 0.9rem', cursor: 'pointer', fontSize: '0.82rem', fontWeight: 'bold', whiteSpace: 'nowrap' },
-    sellBtn: { backgroundColor: '#ef5350', color: '#fff', border: 'none', borderRadius: '4px', padding: '0.45rem 0.9rem', cursor: 'pointer', fontSize: '0.82rem', fontWeight: 'bold', whiteSpace: 'nowrap' },
-    buyModalBtn: { flex: 1, backgroundColor: '#26a69a', border: 'none', borderRadius: '4px', padding: '0.6rem', color: '#fff', cursor: 'pointer', fontWeight: 'bold' },
-    sellModalBtn: { flex: 1, backgroundColor: '#ef5350', border: 'none', borderRadius: '4px', padding: '0.6rem', color: '#fff', cursor: 'pointer', fontWeight: 'bold' },
-
-    priceBar: { display: 'flex', alignItems: 'center', gap: '1rem', padding: '0.6rem 1.5rem', backgroundColor: '#1e222d', borderBottom: '1px solid #2a2e39' },
-    tradeBar: { marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '0.6rem' },
-    tickerName: { color: '#d1d4dc', fontWeight: 'bold', fontSize: '1.1rem' },
-    price: { color: '#d1d4dc', fontSize: '1.1rem' },
-    change: { fontSize: '0.95rem' },
-    noPrice: { color: '#787b86', fontSize: '0.85rem' },
-
-    intervalBar: { display: 'flex', gap: '0.4rem', padding: '0.6rem 1.5rem', backgroundColor: '#131722', borderBottom: '1px solid #2a2e39' },
-    intervalBtn: { backgroundColor: 'transparent', color: '#787b86', border: 'none', borderRadius: '4px', padding: '0.3rem 0.7rem', cursor: 'pointer', fontSize: '0.85rem' },
-    intervalBtnActive: { backgroundColor: '#2962ff', color: '#ffffff' },
-
-    errorMsg: { color: '#f7525f', padding: '0.5rem 1.5rem', fontSize: '0.85rem', margin: 0 },
-
-    // Drawing options bar
-    drawingBar: {
-        display: 'flex', alignItems: 'center', gap: '0.75rem',
-        padding: '0.4rem 1rem', backgroundColor: '#1e222d', borderBottom: '1px solid #2a2e39',
-    },
-    drawingBarLabel: { color: '#d1d4dc', fontSize: '0.78rem', fontWeight: 600, minWidth: '72px' },
-    swatchRow: { display: 'flex', gap: '5px', alignItems: 'center' },
-    swatch: { width: '16px', height: '16px', borderRadius: '50%', border: '1px solid rgba(255,255,255,0.15)', cursor: 'pointer', padding: 0 },
-    widthRow: { display: 'flex', gap: '3px', alignItems: 'center' },
-    widthBtn: { width: '28px', height: '24px', backgroundColor: '#131722', border: '1px solid #2a2e39', borderRadius: '3px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' },
-    widthBtnOn: { border: '1px solid #2962ff', backgroundColor: '#2962ff20' },
-    drawingHint: { color: '#f5c518', fontSize: '0.75rem', marginLeft: '0.25rem' },
-    escBtn: { backgroundColor: 'transparent', border: '1px solid #363a45', borderRadius: '3px', padding: '0.15rem 0.5rem', color: '#787b86', cursor: 'pointer', fontSize: '0.75rem' },
-
-    // Drawing count badge in tool strip (informational, no click)
-    drawingCountBadge: {
-        width: '40px', height: '36px',
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-        gap: '1px', color: '#787b86',
-    },
-
-    // Selection bar (appears when a drawing IS selected)
-    selBar: {
-        display: 'flex', alignItems: 'center', gap: '0.75rem',
-        padding: '0.35rem 1rem', backgroundColor: '#2a3a2a', borderBottom: '1px solid #26a69a40',
-    },
-    selDot: {
-        width: '8px', height: '8px', borderRadius: '50%',
-        backgroundColor: '#26a69a', flexShrink: 0,
-    },
-    selText: { color: '#d1d4dc', fontSize: '0.82rem', fontWeight: 500 },
-    selDelete: {
-        backgroundColor: '#ef535015', border: '1px solid #ef535060',
-        borderRadius: '4px', padding: '0.2rem 0.65rem',
-        color: '#ef5350', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 500,
-    },
-    selClose: {
-        backgroundColor: 'transparent', border: '1px solid #363a45',
-        borderRadius: '4px', padding: '0.2rem 0.55rem',
-        color: '#787b86', cursor: 'pointer', fontSize: '0.78rem',
-    },
-    selHint: { color: '#454c55', fontSize: '0.72rem', marginLeft: 'auto' },
-
-    // Select-mode hint bar (shown in Select mode when no drawing is selected but drawings exist)
-    selectHintBar: {
-        display: 'flex', alignItems: 'center', gap: '1rem',
-        padding: '0.35rem 1rem', backgroundColor: '#1e222d', borderBottom: '1px solid #2a2e39',
-    },
-    selectHintText: { color: '#787b86', fontSize: '0.78rem', flex: 1 },
-    kbd: {
-        backgroundColor: '#2a2e39', border: '1px solid #363a45',
-        borderRadius: '3px', padding: '0 4px', fontSize: '0.72rem', color: '#d1d4dc',
-        fontFamily: 'monospace',
-    },
-    clearAllBtn: {
-        backgroundColor: 'transparent', border: '1px solid #ef535040',
-        borderRadius: '4px', padding: '0.2rem 0.65rem',
-        color: '#ef535090', cursor: 'pointer', fontSize: '0.78rem',
-        whiteSpace: 'nowrap',
-    },
-
-    alertsPanel: { backgroundColor: '#1e222d', borderBottom: '1px solid #2a2e39', padding: '0.75rem 1.5rem' },
-    alertsPanelTitle: { color: '#787b86', fontSize: '0.75rem', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.5rem' },
-    noAlertsText: { color: '#787b86', fontWeight: 'normal' },
-    alertRow: { display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.4rem 0', borderBottom: '1px solid #2a2e39' },
-    alertConditionBadge: (condition) => ({
-        backgroundColor: condition === 'ABOVE' ? '#26a69a20' : '#ef535020',
-        color: condition === 'ABOVE' ? '#26a69a' : '#ef5350',
-        border: `1px solid ${condition === 'ABOVE' ? '#26a69a' : '#ef5350'}`,
-        borderRadius: '3px', padding: '0.15rem 0.4rem', fontSize: '0.75rem', fontWeight: 'bold',
-    }),
-    alertPrice: { color: '#d1d4dc', fontSize: '0.85rem', flex: 1 },
-    cancelAlertBtn: { backgroundColor: 'transparent', border: '1px solid #363a45', borderRadius: '3px', padding: '0.15rem 0.5rem', color: '#787b86', cursor: 'pointer', fontSize: '0.75rem' },
-
-    chartWrapper: { flex: 1, padding: '0.5rem 1.5rem 1rem' },
-    chart: { width: '100%' },
-
-    // ─── Indicator controls ───────────────────────────────────────────────────
-    intervalSep: { width: '1px', height: '16px', backgroundColor: '#2a2e39', margin: '0 4px', alignSelf: 'center' },
-    indicatorMenuBtn: {
-        backgroundColor: 'transparent', color: '#787b86',
-        border: '1px solid #2a2e39', borderRadius: '4px',
-        padding: '0.28rem 0.65rem', cursor: 'pointer', fontSize: '0.82rem',
-    },
-    indicatorMenuBtnOn: { color: '#d1d4dc', borderColor: '#787b86' },
-    indicatorMenu: {
-        position: 'absolute', top: '100%', left: 0, marginTop: '4px',
-        backgroundColor: '#1e222d', border: '1px solid #363a45', borderRadius: '6px',
-        padding: '8px 4px', zIndex: 200, minWidth: '150px', boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
-    },
-    indicatorMenuTitle: {
-        color: '#454c55', fontSize: '0.68rem', fontWeight: 'bold',
-        textTransform: 'uppercase', letterSpacing: '0.08em',
-        padding: '2px 10px 4px',
-    },
-    indicatorMenuItem: {
-        display: 'flex', alignItems: 'center', width: '100%',
-        backgroundColor: 'transparent', border: 'none',
-        padding: '6px 10px', cursor: 'pointer',
-        color: '#787b86', fontSize: '0.82rem', textAlign: 'left', borderRadius: '4px',
-    },
-    indicatorMenuItemOn: { color: '#d1d4dc', backgroundColor: '#2a2e39' },
-    checkMark: { marginLeft: 'auto', color: '#26a69a', fontSize: '0.78rem' },
-    indicatorPill: {
-        display: 'inline-flex', alignItems: 'center', gap: '4px',
-        border: '1px solid', borderRadius: '3px',
-        padding: '0.18rem 0.45rem', fontSize: '0.75rem',
-    },
-    indicatorPillClose: {
-        background: 'none', border: 'none', cursor: 'pointer',
-        color: 'inherit', padding: 0, fontSize: '0.7rem', opacity: 0.7, lineHeight: 1,
-    },
-
-    // ─── Model prediction legend ─────────────────────────────────────────────
-    predictionLegend: {
-        position: 'absolute', top: 8, left: 8, zIndex: 40, pointerEvents: 'none',
-        maxWidth: 'min(460px, 70%)', padding: '6px 9px', borderRadius: '4px',
-        backgroundColor: 'rgba(30,34,45,0.88)', border: '1px solid #2a2e39',
-        fontSize: '0.75rem', lineHeight: 1.45, display: 'flex', flexDirection: 'column', gap: '2px',
-    },
-    predictionLegendHeadline: { fontWeight: 600, fontSize: '0.8rem' },
-    predictionLegendMuted: { color: '#9598a1' },
-    predictionLegendWarn: { color: '#f5c518' },
-
-    // ─── OHLCV tooltip (adapted from tooltip plugin) ──────────────────────────
-    ohlcvTooltip: {
-        position: 'absolute', pointerEvents: 'none', zIndex: 50,
-        backgroundColor: 'rgba(30,34,45,0.92)',
-        border: '1px solid #363a45', borderRadius: '5px',
-        padding: '5px 10px',
-        backdropFilter: 'blur(4px)',
-        boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
-    },
-    ohlcvItem: { display: 'flex', flexDirection: 'column', alignItems: 'center' },
-    ohlcvLabel: { color: '#787b86', fontSize: '0.65rem', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.04em' },
-    ohlcvValue: { fontSize: '0.78rem', fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
-};

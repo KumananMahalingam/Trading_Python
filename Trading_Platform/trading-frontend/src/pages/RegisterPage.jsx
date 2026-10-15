@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { register as registerApi } from '../api/authApi';
+import AuthLayout from '../components/AuthLayout';
 
 export default function RegisterPage() {
     const [username, setUsername] = useState('');
@@ -27,138 +28,45 @@ export default function RegisterPage() {
     };
 
     return (
-        <div style={styles.container}>
-            <div style={styles.card}>
-                <h1 style={styles.title}>TradingView Clone</h1>
-                <p style={styles.subtitle}>Create your account</p>
+        <AuthLayout
+            title="Create your account"
+            subtitle="Start paper trading with $100,000"
+            footer={<>Already have an account? <Link to="/login">Sign in</Link></>}
+        >
+            <form onSubmit={handleSubmit}>
+                <label className="field">
+                    <span className="field-label">Username</span>
+                    <input
+                        className="input" type="text" autoComplete="username" required
+                        value={username} onChange={(e) => setUsername(e.target.value)}
+                        placeholder="Enter your username"
+                    />
+                </label>
 
-                <form onSubmit={handleSubmit} style={styles.form}>
-                    <div style={styles.inputGroup}>
-                        <label style={styles.label}>Username</label>
-                        <input
-                            type="text"
-                            value={username}
-                            onChange={(e) => setUsername(e.target.value)}
-                            placeholder="Enter your username"
-                            required
-                            style={styles.input}
-                        />
-                    </div>
+                <label className="field">
+                    <span className="field-label">Email</span>
+                    <input
+                        className="input" type="email" autoComplete="email" required
+                        value={email} onChange={(e) => setEmail(e.target.value)}
+                        placeholder="Enter your email"
+                    />
+                </label>
 
-                    <div style={styles.inputGroup}>
-                        <label style={styles.label}>Email</label>
-                        <input
-                            type="email"
-                            value={email}
-                            onChange={(e) => setEmail(e.target.value)}
-                            placeholder="Enter your email"
-                            required
-                            style={styles.input}
-                        />
-                    </div>
+                <label className="field">
+                    <span className="field-label">Password</span>
+                    <input
+                        className="input" type="password" autoComplete="new-password" required
+                        value={password} onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Enter your password"
+                    />
+                </label>
 
-                    <div style={styles.inputGroup}>
-                        <label style={styles.label}>Password</label>
-                        <input
-                            type="password"
-                            value={password}
-                            onChange={(e) => setPassword(e.target.value)}
-                            placeholder="Enter your password"
-                            required
-                            style={styles.input}
-                        />
-                    </div>
+                {error && <p className="form-error" role="alert">{error}</p>}
 
-                    {error && <p style={styles.error}>{error}</p>}
-
-                    <button type="submit" disabled={loading} style={styles.button}>
-                        {loading ? 'Creating account...' : 'Create Account'}
-                    </button>
-                </form>
-
-                <p style={styles.footer}>
-                    Already have an account?{' '}
-                    <Link to="/login" style={styles.link}>Sign in here</Link>
-                </p>
-            </div>
-        </div>
+                <button type="submit" disabled={loading} className="btn btn-primary btn-lg btn-block">
+                    {loading ? 'Creating account...' : 'Create Account'}
+                </button>
+            </form>
+        </AuthLayout>
     );
 }
-
-const styles = {
-    container: {
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        minHeight: '100vh',
-        backgroundColor: '#131722',
-    },
-    card: {
-        backgroundColor: '#1e222d',
-        padding: '2.5rem',
-        borderRadius: '8px',
-        width: '100%',
-        maxWidth: '400px',
-        boxShadow: '0 4px 24px rgba(0,0,0,0.4)',
-    },
-    title: {
-        color: '#d1d4dc',
-        fontSize: '1.5rem',
-        marginBottom: '0.5rem',
-        textAlign: 'center',
-    },
-    subtitle: {
-        color: '#787b86',
-        fontSize: '0.9rem',
-        textAlign: 'center',
-        marginBottom: '2rem',
-    },
-    form: {
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '1.2rem',
-    },
-    inputGroup: {
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '0.4rem',
-    },
-    label: {
-        color: '#d1d4dc',
-        fontSize: '0.85rem',
-    },
-    input: {
-        backgroundColor: '#2a2e39',
-        border: '1px solid #363a45',
-        borderRadius: '4px',
-        padding: '0.75rem 1rem',
-        color: '#d1d4dc',
-        fontSize: '0.95rem',
-        outline: 'none',
-    },
-    error: {
-        color: '#f7525f',
-        fontSize: '0.85rem',
-        margin: 0,
-    },
-    button: {
-        backgroundColor: '#2962ff',
-        color: '#ffffff',
-        border: 'none',
-        borderRadius: '4px',
-        padding: '0.85rem',
-        fontSize: '1rem',
-        cursor: 'pointer',
-        marginTop: '0.5rem',
-    },
-    footer: {
-        color: '#787b86',
-        fontSize: '0.85rem',
-        textAlign: 'center',
-        marginTop: '1.5rem',
-    },
-    link: {
-        color: '#2962ff',
-        textDecoration: 'none',
-    },
-};

@@ -218,7 +218,7 @@ docker compose --profile app down              # stop (data volumes are kept)
 
 1. Open a symbol and pick the **1D** interval. Predictions are daily, so the
    option is hidden on other intervals.
-2. Open **ƒ Indicators → Model → Model prediction**. The chart then shows:
+2. Open **Indicators → Model prediction** in the chart toolbar. The chart then shows:
    - **Backtest:** a dotted orange line of the model's one-step-ahead
      predicted closes over its test period, inside a shaded ±2σ band, against
      the real candles.

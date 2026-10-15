@@ -8,7 +8,7 @@ import PortfolioPage from './pages/PortfolioPage';
 function ProtectedRoute({ children }) {
     const { accessToken, loading } = useAuth();
 
-    if (loading) return <div style={{ color: '#d1d4dc', padding: '2rem' }}>Loading...</div>;
+    if (loading) return <div className="page-loading">Loading…</div>;
 
     return accessToken ? children : <Navigate to="/login" />;
 }
@@ -16,7 +16,7 @@ function ProtectedRoute({ children }) {
 function RootRedirect() {
     const { accessToken, loading } = useAuth();
 
-    if (loading) return <div style={{ color: '#d1d4dc', padding: '2rem' }}>Loading...</div>;
+    if (loading) return <div className="page-loading">Loading…</div>;
 
     return <Navigate to={accessToken ? '/chart' : '/login'} />;
 }
