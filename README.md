@@ -7,6 +7,10 @@ next-day forecast and how it did over its backtest. From the same panel they
 can refresh the prediction with the latest data or retrain the model on any
 supported stock or crypto pair, then follow the run's progress live.
 
+![Project Screenshot](images/Trading2.png)
+![Project Screenshot](images/Trading1.png)
+
+
 ---
 
 ## Contents
