@@ -68,7 +68,7 @@ A typical run:
 ## Repository layout
 
 Everything lives in this one repository. The trading platform is in
-`Trading_Platform/` (see [Credits and license](#credits-and-license)).
+`Trading_Platform/`.
 
 ```
 Trading_Python/
