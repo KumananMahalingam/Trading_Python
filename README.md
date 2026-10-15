@@ -31,7 +31,6 @@ supported stock or crypto pair, then follow the run's progress live.
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Legacy research pipeline](#legacy-research-pipeline)
-- [Credits and license](#credits-and-license)
 
 ---
 
